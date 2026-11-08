@@ -1,0 +1,31 @@
+{
+  "name": "@decentracord/server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@nestjs/common": "12.4.0",
+    "@nestjs/core": "12.4.0",
+    "@nestjs/platform-express": "12.4.0",
+    "@nestjs/platform-socket.io": "12.4.0",
+    "@nestjs/websockets": "12.4.0",
+    "argon2": "0.45.2",
+    "connect-pg-simple": "10.0.0",
+    "express": "5.3.0",
+    "express-session": "1.19.0",
+    "node-pg-migrate": "9.0.0",
+    "pg": "8.23.1",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2",
+    "socket.io": "4.8.4"
+  },
+  "devDependencies": {
+    "@types/connect-pg-simple": "7.0.3",
+    "@types/express": "5.0.6",
+    "@types/express-session": "1.19.0",
+    "@types/pg": "8.23.1"
+  }
+}

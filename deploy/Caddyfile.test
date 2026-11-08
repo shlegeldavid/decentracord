@@ -1,0 +1,13 @@
+{
+	admin off
+	auto_https off
+}
+
+http://proxy {
+	redir https://proxy{uri} permanent
+}
+
+https://proxy:443 {
+	tls /run/secrets/tls_server_cert /run/secrets/tls_server_key
+	reverse_proxy app:3000
+}

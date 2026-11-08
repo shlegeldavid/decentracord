@@ -1,0 +1,31 @@
+{
+  "name": "decentracord",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=26.13.0 <27"
+  },
+  "workspaces": [
+    "apps/server",
+    "apps/web"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @decentracord/server && npm run build --workspace @decentracord/web",
+    "lint": "eslint apps/server/src apps/web/src apps/web/vite.config.ts migrations tests/helpers tests/integration tests/e2e playwright.config.ts vitest.config.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.base.json && npm run typecheck --workspace @decentracord/server && npm run typecheck --workspace @decentracord/web",
+    "test:doctor": "node --import tsx --test tests/integration/installation-doctor.test.ts",
+    "test:integration": "vitest run",
+    "test:e2e": "node --import tsx tests/e2e/fixtures.ts",
+    "test:e2e:playwright": "playwright test",
+    "db:migrate": "docker compose run --rm app migrate"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.0",
+    "@types/node": "26.6.6",
+    "eslint": "10.14.0",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1",
+    "vitest": "5.1.0"
+  }
+}

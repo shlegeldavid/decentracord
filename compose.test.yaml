@@ -1,0 +1,127 @@
+services:
+  db:
+    image: postgres:18.6-bookworm@sha256:f1ea2a1a4fb7b68d4836be1fdcb8a6466a89b072158bf9d97663600538c294c5
+    environment:
+      POSTGRES_DB: decentracord_test
+      POSTGRES_USER: decentracord
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_password
+    volumes:
+      - test-postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - test
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      NODE_ENV: production
+      DECENTRACORD_TEST_TLS: "1"
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME: decentracord_test
+      DB_USER: decentracord
+      DB_PASSWORD_FILE: /run/secrets/db_password
+      DB_CONNECT_TIMEOUT_MS: "3000"
+      APP_HOST: 0.0.0.0
+      APP_PORT: "3000"
+      APP_ORIGIN: https://proxy
+      PUBLIC_HOST: proxy
+    secrets:
+      - db_password
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:' + process.env.APP_PORT + '/healthz').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - test
+
+  proxy:
+    image: caddy:2.11.8-alpine@sha256:f6228111e5fafa1a5238258d0858e103f10599b8d1659a146e7726681a002bb9
+    volumes:
+      - ./deploy/Caddyfile.test:/etc/caddy/Caddyfile:ro
+    secrets:
+      - tls_server_cert
+      - tls_server_key
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 3s
+    networks:
+      - test
+
+  runner:
+    build:
+      context: .
+      dockerfile: tests/Dockerfile
+    environment:
+      NODE_ENV: ${NODE_ENV:?NODE_ENV is required}
+      E2E_EXTERNAL_STACK: ${E2E_EXTERNAL_STACK:?E2E_EXTERNAL_STACK is required}
+      TEST_RUN_DIR: ${TEST_RUN_DIR:?TEST_RUN_DIR is required}
+      TEST_COMPOSE_PROJECT: ${TEST_COMPOSE_PROJECT:?TEST_COMPOSE_PROJECT is required}
+      TEST_ORIGIN: ${TEST_ORIGIN:?TEST_ORIGIN is required}
+      NODE_EXTRA_CA_CERTS: /test-ca/ca.crt
+      TEST_CA_FILE: /test-ca/ca.crt
+      TEST_UNTRUSTED_CA_FILE: /test-ca/untrusted-ca.crt
+      TEST_DATABASE_SECRET_FILE: /run/secrets/test_db_credentials
+      TEST_DATABASE_NAME: decentracord_test
+      TEST_DATABASE_HOST: db
+      TEST_DATABASE_PORT: "5432"
+      TEST_SPECS_JSON: ${TEST_SPECS_JSON:?TEST_SPECS_JSON must contain the selected Playwright specs}
+      E2E_BASE_URL: https://proxy:443
+      E2E_ORGANIZATION_NAME: ${E2E_ORGANIZATION_NAME:-Организация}
+      E2E_ADMIN_LOGIN: ${E2E_ADMIN_LOGIN:?E2E_ADMIN_LOGIN is required}
+      E2E_ADMIN_PASSWORD: ${E2E_ADMIN_PASSWORD:?E2E_ADMIN_PASSWORD is required}
+      E2E_EMPLOYEE_LOGIN: ${E2E_EMPLOYEE_LOGIN:?E2E_EMPLOYEE_LOGIN is required}
+      E2E_EMPLOYEE_PASSWORD: ${E2E_EMPLOYEE_PASSWORD:?E2E_EMPLOYEE_PASSWORD is required}
+    secrets:
+      - test_db_credentials
+    volumes:
+      - type: bind
+        source: ${TLS_CA_CERT_FILE:?TLS_CA_CERT_FILE is required}
+        target: /test-ca/ca.crt
+        read_only: true
+      - type: bind
+        source: ${TLS_UNTRUSTED_CA_CERT_FILE:?TLS_UNTRUSTED_CA_CERT_FILE is required}
+        target: /test-ca/untrusted-ca.crt
+        read_only: true
+    depends_on:
+      proxy:
+        condition: service_healthy
+    networks:
+      - test
+
+volumes:
+  test-postgres-data:
+
+networks:
+  test:
+    internal: true
+
+secrets:
+  db_password:
+    file: ${TLS_DB_PASSWORD_FILE:?TLS_DB_PASSWORD_FILE is required}
+  test_db_credentials:
+    file: ${TLS_DB_CREDENTIALS_FILE:?TLS_DB_CREDENTIALS_FILE is required}
+  tls_server_cert:
+    file: ${TLS_SERVER_CERT_FILE:?TLS_SERVER_CERT_FILE is required}
+  tls_server_key:
+    file: ${TLS_SERVER_KEY_FILE:?TLS_SERVER_KEY_FILE is required}

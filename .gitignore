@@ -1,0 +1,9 @@
+node_modules/
+**/node_modules/
+apps/server/dist/
+coverage/
+.env
+.env.*
+!.env.example
+secrets/
+*.log
