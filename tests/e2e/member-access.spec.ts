@@ -1,4 +1,4 @@
-import { test, expect, type Browser, type BrowserContext, type Page } from "./fixtures.js";
+import { test, expect, openSettingsSection, type Browser, type BrowserContext, type Page } from "./fixtures.js";
 import type { APIRequestContext } from "@playwright/test";
 
 const applicationOrigin = process.env.E2E_BASE_URL ?? "http://decentracord.test:3000";
@@ -10,7 +10,7 @@ async function login(page: Page, credentials: { login: string; password: string 
   await page.getByLabel("Логин").fill(credentials.login);
   await page.getByLabel("Пароль").fill(credentials.password);
   await page.getByRole("button", { name: "Войти" }).click();
-  await expect(page.getByRole("button", { name: "Настройки аккаунта" })).toBeVisible();
+  await expect(page.locator(".app-shell")).toBeVisible();
 }
 
 async function newAuthenticatedPage(
@@ -32,12 +32,14 @@ async function issueCsrf(request: APIRequestContext): Promise<string> {
 }
 
 async function createMemberFromUi(page: Page, loginValue: string, password: string): Promise<void> {
-  await page.getByRole("button", { name: "Участники" }).click();
-  await expect(page.getByRole("heading", { name: "Участники" })).toBeVisible();
+  await openSettingsSection(page, "Участники");
+  await expect(page.getByRole("heading", { name: "Участники", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Добавить участника", exact: true }).click();
   await page.getByLabel("Логин").fill(loginValue);
   await page.getByLabel("Пароль").fill(password);
   await page.getByRole("button", { name: "Создать участника" }).click();
   await expect(page.getByText("Участник создан. Пароль больше не отображается.", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Добавить участника", exact: true }).click();
   await expect(page.getByLabel("Пароль")).toHaveValue("");
 }
 
@@ -79,15 +81,18 @@ test.describe("administrator member access", () => {
     try {
       await expect(first.page.getByRole("heading", { name: identity.organizationName })).toBeVisible();
       await expect(second.page.getByRole("heading", { name: identity.organizationName })).toBeVisible();
-      await expect(first.page.getByRole("status")).toContainText("подключено");
-      await expect(second.page.getByRole("status")).toContainText("подключено");
+      await expect(first.page.locator(".connection-status")).toContainText("подключено");
+      await expect(second.page.locator(".connection-status")).toContainText("подключено");
 
       const row = page.getByRole("listitem").filter({ hasText: targetLogin });
       await row.getByRole("button", { name: "Сбросить пароль" }).click();
       await row.getByLabel(`Новый пароль для ${targetLogin}`).fill(newPassword);
-      await row.getByLabel("Подтверждаю завершение всех входов сотрудника").check();
-      await row.getByRole("button", { name: "Сбросить пароль и завершить входы" }).click();
+      await row.getByRole("button", { name: "Сбросить пароль" }).click();
+      const resetDialog = page.getByRole("dialog", { name: "Сбросить пароль" });
+      await resetDialog.getByLabel("Подтверждаю завершение всех входов сотрудника").check();
+      await resetDialog.getByRole("button", { name: "Сбросить пароль и завершить входы" }).click();
       await expect(row.getByRole("status")).toHaveText("Пароль сброшен. Все прежние сеансы завершены.");
+      await row.getByRole("button", { name: "Сбросить пароль" }).click();
       await expect(row.getByLabel(`Новый пароль для ${targetLogin}`)).toHaveValue("");
 
       await expect(first.page.getByRole("heading", { name: "Вход" })).toBeVisible();
@@ -113,7 +118,7 @@ test.describe("administrator member access", () => {
       await fresh.getByLabel("Пароль").fill(newPassword);
       await fresh.getByRole("button", { name: "Войти" }).click();
       await expect(fresh.getByRole("heading", { name: identity.organizationName })).toBeVisible();
-      await expect(fresh.getByRole("button", { name: "Настройки аккаунта" })).toBeVisible();
+      await expect(fresh.locator(".app-shell")).toBeVisible();
       expect(await page.content()).not.toContain(newPassword);
     } finally {
       await first.context.close();
@@ -133,13 +138,14 @@ test.describe("administrator member access", () => {
     try {
       await expect(first.page.getByRole("heading", { name: identity.organizationName })).toBeVisible();
       await expect(second.page.getByRole("heading", { name: identity.organizationName })).toBeVisible();
-      await expect(first.page.getByRole("status")).toContainText("подключено");
-      await expect(second.page.getByRole("status")).toContainText("подключено");
+      await expect(first.page.locator(".connection-status")).toContainText("подключено");
+      await expect(second.page.locator(".connection-status")).toContainText("подключено");
 
       const row = page.getByRole("listitem").filter({ hasText: targetLogin });
       await row.getByRole("button", { name: "Отключить" }).click();
-      await row.getByLabel("Подтверждаю отключение учётной записи и завершение всех входов").check();
-      await row.getByRole("button", { name: "Подтвердить отключение" }).click();
+      const disableDialog = page.getByRole("dialog", { name: "Отключить участника" });
+      await disableDialog.getByLabel("Подтверждаю отключение учётной записи и завершение всех входов").check();
+      await disableDialog.getByRole("button", { name: "Отключить участника" }).click();
       await expect(row.getByText("Отключён", { exact: true })).toBeVisible();
       await expect(row.getByRole("status")).toHaveText("Учётная запись отключена. Все прежние сеансы завершены.");
       await expect(first.page.getByRole("heading", { name: "Вход" })).toBeVisible();

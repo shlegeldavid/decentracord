@@ -158,7 +158,7 @@ async function bootstrapAdmin(args: string[]): Promise<void> {
 
     await client.query("INSERT INTO organization (id, name) VALUES (1, $1)", ["Организация"]);
     const roles = await client.query<{ id: string; system_key: string }>(
-      "INSERT INTO roles (system_key, name, position, permissions) VALUES ('everyone', '@everyone', 0, '[]'::jsonb), ('administrator', 'Administrator', 1, '[\"ADMINISTRATOR\"]'::jsonb) RETURNING id, system_key"
+      "INSERT INTO roles (system_key, name, position, permissions) VALUES ('everyone', '@everyone', 0, '[]'::jsonb), ('administrator', 'Administrator', 1000000, '[\"ADMINISTRATOR\"]'::jsonb) RETURNING id, system_key"
     );
     const everyoneRole = roles.rows.find((role) => role.system_key === "everyone");
     const administratorRole = roles.rows.find((role) => role.system_key === "administrator");
@@ -170,6 +170,7 @@ async function bootstrapAdmin(args: string[]): Promise<void> {
     );
     const userId = user.rows[0]?.id;
     if (!userId) throw new Error("Administrator was not created");
+    await client.query("UPDATE users SET is_owner = true WHERE id = $1", [userId]);
     await client.query(
       "INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2), ($1, $3)",
       [userId, everyoneRole.id, administratorRole.id]

@@ -4,7 +4,9 @@ import type { Request, RequestHandler, Response } from "express";
 import session from "express-session";
 import { HttpException } from "@nestjs/common";
 import type { Pool, PoolClient } from "pg";
-import { parsePasswordChange } from "./contracts.js";
+import type { AccessService } from "../access/access.service.js";
+import type { Permission } from "../access/permissions.js";
+import { parsePasswordChange, parseUpdatePreferences } from "./contracts.js";
 import { PasswordService } from "./password.service.js";
 import { ABSOLUTE_SESSION_TTL_MS, GuardedSessionStore, IDLE_SESSION_TTL_MS } from "./session-store.js";
 
@@ -28,6 +30,18 @@ export interface AuthenticatedRequest extends Request {
   authPrincipal?: AuthPrincipal;
 }
 
+export interface CurrentUserResponse {
+  id: string;
+  login: string;
+  permissions: Permission[];
+  isOwner: boolean;
+  roleIds: string[];
+  roleNames: string[];
+  theme: "dark" | "light";
+  timezone: string | null;
+  roles: Array<{ id: string; name: string; color: string | null; position: number }>;
+}
+
 interface LoginUserRow {
   id: string;
   login: string;
@@ -39,6 +53,9 @@ interface LoginUserRow {
 interface CurrentUserRow {
   id: string;
   login: string;
+  theme: "dark" | "light";
+  timezone: string | null;
+  roles: Array<{ id: string; name: string; color: string | null; position: number }>;
 }
 
 function apiError(status: number, code: string, message: string): HttpException {
@@ -116,7 +133,8 @@ export class SessionService {
   constructor(
     private readonly pool: Pool,
     private readonly passwordService: PasswordService,
-    private readonly now: () => number = Date.now
+    private readonly now: () => number = Date.now,
+    private readonly access?: AccessService
   ) {}
 
   createMiddleware(): RequestHandler {
@@ -259,14 +277,54 @@ export class SessionService {
     return { authVersion: auth.authVersion, sessionId: request.sessionID, userId: auth.userId };
   }
 
-  async currentUser(principal: AuthPrincipal): Promise<{ id: string; login: string }> {
+  async currentUser(principal: AuthPrincipal): Promise<CurrentUserResponse> {
     const result = await this.pool.query<CurrentUserRow>(
-      "SELECT id, login FROM users WHERE id = $1 AND active = true AND auth_version = $2",
+      "SELECT user_account.id, user_account.login, user_account.theme, user_account.timezone, " +
+        "COALESCE((SELECT jsonb_agg(jsonb_build_object(" +
+        "'id', assigned_role.id::text, 'name', assigned_role.name, " +
+        "'color', assigned_role.color, 'position', assigned_role.position) " +
+        "ORDER BY assigned_role.position DESC) " +
+        "FROM user_roles AS assignment " +
+        "JOIN roles AS assigned_role ON assigned_role.id = assignment.role_id " +
+        "AND assigned_role.system_key IS DISTINCT FROM 'everyone' " +
+        "WHERE assignment.user_id = user_account.id), '[]'::jsonb) AS roles " +
+        "FROM users AS user_account " +
+        "WHERE user_account.id = $1 AND user_account.active = true AND user_account.auth_version = $2",
       [principal.userId, principal.authVersion]
     );
     const user = result.rows[0];
     if (!user) throw apiError(401, "UNAUTHORIZED", "Требуется вход");
-    return { id: user.id, login: user.login };
+    if (!this.access) throw new Error("Access service is unavailable");
+    const access = await this.access.currentUserAccess(user.id);
+    if (!access) throw apiError(401, "UNAUTHORIZED", "Требуется вход");
+    return { ...user, ...access };
+  }
+
+  async updatePreferences(
+    principal: AuthPrincipal,
+    request: Request,
+    value: unknown
+  ): Promise<CurrentUserResponse> {
+    this.assertCsrf(request);
+    const input = parseUpdatePreferences(value);
+    if (!input) throw apiError(400, "INVALID_REQUEST", "Проверьте тему и часовой пояс");
+
+    const values: Array<string | number | null> = [];
+    const fields: string[] = [];
+    if (input.theme !== undefined) {
+      values.push(input.theme);
+      fields.push("theme = $" + values.length);
+    }
+    if (input.timezone !== undefined) {
+      values.push(input.timezone);
+      fields.push("timezone = $" + values.length);
+    }
+    values.push(principal.userId, principal.authVersion);
+    const sql = "UPDATE users SET " + fields.join(", ") +
+      " WHERE id = $" + (values.length - 1) + " AND active = true AND auth_version = $" + values.length;
+    const result = await this.pool.query(sql, values);
+    if (result.rowCount !== 1) throw apiError(401, "UNAUTHORIZED", "Требуется вход");
+    return this.currentUser(principal);
   }
 
   async changePassword(principal: AuthPrincipal, request: Request, value: unknown): Promise<void> {

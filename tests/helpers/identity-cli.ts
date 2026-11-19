@@ -107,12 +107,16 @@ async function readPasswordFromStdin(): Promise<string> {
 
 async function createUser(args: string[]): Promise<void> {
   let loginInput: string | undefined;
+  let roleNameInput: string | undefined;
   let administrator = false;
 
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
     if (argument === "--login" && loginInput === undefined) {
       loginInput = args[index + 1];
+      index += 1;
+    } else if (argument === "--role" && roleNameInput === undefined && typeof args[index + 1] === "string") {
+      roleNameInput = args[index + 1];
       index += 1;
     } else if (argument === "--admin" && !administrator) {
       administrator = true;
@@ -176,13 +180,31 @@ async function createUser(args: string[]): Promise<void> {
     if (!userId) throw new Error("Test user was not created");
     await client.query("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)", [userId, everyoneRoleId]);
 
+    if (roleNameInput !== undefined) {
+      const role = await client.query<{ id: string }>(
+        "SELECT id FROM roles WHERE lower(name) = lower($1)",
+        [roleNameInput.trim()]
+      );
+      const roleId = role.rows[0]?.id;
+      if (!roleId) throw new Error("Requested fixture role is missing");
+      if (roleId !== everyoneRoleId) {
+        await client.query(
+          "INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT (user_id, role_id) DO NOTHING",
+          [userId, roleId]
+        );
+      }
+    }
+
     if (administrator) {
       const adminRole = await client.query<{ id: string }>(
         "SELECT id FROM roles WHERE system_key = 'administrator'"
       );
       const administratorRoleId = adminRole.rows[0]?.id;
       if (!administratorRoleId) throw new Error("Administrator test role is missing");
-      await client.query("INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2)", [userId, administratorRoleId]);
+      await client.query(
+        "INSERT INTO user_roles (user_id, role_id) VALUES ($1, $2) ON CONFLICT (user_id, role_id) DO NOTHING",
+        [userId, administratorRoleId]
+      );
     }
 
     await client.query("COMMIT");

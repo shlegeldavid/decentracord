@@ -600,8 +600,14 @@ if (!inContainer) {
         );
         expect(saved.rows[0]).toEqual({ id: target.id, login: target.login, active: false, assignments: 1 });
         const members = await request(adminSession, "/api/members");
-        const memberList = await members.json() as { members: Array<{ id: string; login: string; active: boolean }> };
-        expect(memberList.members.find((item) => item.id === target.id)).toEqual({ id: target.id, login: target.login, active: false });
+        const memberList = await members.json() as { members: Array<{ id: string; login: string; active: boolean; roleIds: string[]; roleNames: string[] }> };
+        expect(memberList.members.find((item) => item.id === target.id)).toEqual({
+          id: target.id,
+          login: target.login,
+          active: false,
+          roleIds: [],
+          roleNames: []
+        });
 
         expect((await resetMember(adminSession, target.id, `New-after-disable-${randomBytes(12).toString("base64url")}`)).status).toBe(409);
         expect((await disableMember(adminSession, adminId)).status).toBe(409);

@@ -1,47 +1,18 @@
 import { randomBytes } from "node:crypto";
 import { io } from "socket.io-client";
-import { test, expect } from "./fixtures.js";
+import {
+  applicationOrigin,
+  captureExternalRequests,
+  expect,
+  normalizedNetworkOrigin,
+  openSettingsSection,
+  test
+} from "./fixtures.js";
 import type { BrowserContext, Page } from "@playwright/test";
-
-const applicationOrigin = new URL(
-  process.env.TEST_ORIGIN ?? process.env.E2E_BASE_URL ?? "http://decentracord.test:3000"
-).origin;
 
 interface Credentials {
   login: string;
   password: string;
-}
-
-function normalizedNetworkOrigin(rawUrl: string): string | undefined {
-  try {
-    const url = new URL(rawUrl);
-    if (url.protocol === "ws:") return `http://${url.host}`;
-    if (url.protocol === "wss:") return `https://${url.host}`;
-    if (url.protocol === "http:" || url.protocol === "https:") return url.origin;
-    return undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function captureExternalRequests(context: BrowserContext): string[] {
-  const unexpected: string[] = [];
-  const record = (url: string, method: string, type: string): void => {
-    const origin = normalizedNetworkOrigin(url);
-    if (origin && origin !== applicationOrigin) {
-      // Keep only safe request metadata; never retain URL queries, headers, or bodies.
-      unexpected.push(`${method} ${origin} (${type})`);
-    }
-  };
-
-  // BrowserContext request events include page navigation, assets, and requests made by workers.
-  context.on("request", (request) => record(request.url(), request.method(), request.resourceType()));
-  const observeWebSockets = (page: Page): void => {
-    page.on("websocket", (websocket) => record(websocket.url(), "GET", "websocket"));
-  };
-  context.pages().forEach(observeWebSockets);
-  context.on("page", observeWebSockets);
-  return unexpected;
 }
 
 async function login(page: Page, credentials: Credentials): Promise<void> {
@@ -50,7 +21,7 @@ async function login(page: Page, credentials: Credentials): Promise<void> {
   await page.getByLabel("Логин").fill(credentials.login);
   await page.getByLabel("Пароль").fill(credentials.password);
   await page.getByRole("button", { name: "Войти" }).click();
-  await expect(page.getByRole("button", { name: "Настройки аккаунта" })).toBeVisible();
+  await expect(page.locator(".app-shell")).toBeVisible();
 }
 
 async function sessionCookie(context: BrowserContext): Promise<string> {
@@ -97,6 +68,9 @@ async function loginAsAdministrator(page: Page, credentials: Credentials, organi
 
 test.describe("installation privacy boundary", () => {
   test("guest shell and protected API responses disclose no organization data", async ({ page, context, request, identity }) => {
+    expect(normalizedNetworkOrigin(`${applicationOrigin}/healthz`)).toBe(applicationOrigin);
+    expect(normalizedNetworkOrigin("wss://outside.invalid/realtime")).toBe("https://outside.invalid");
+    expect(normalizedNetworkOrigin("data:text/plain,private")).toBeUndefined();
     const unexpectedRequests = captureExternalRequests(context);
     const shellResponse = await page.goto(`${applicationOrigin}/`);
     expect(shellResponse?.status()).toBe(200);
@@ -154,6 +128,7 @@ test.describe("installation privacy boundary", () => {
     context,
     identity
   }) => {
+    test.setTimeout(180_000);
     const unexpectedRequests = captureExternalRequests(context);
     const memberLogin = `privacy_${randomBytes(5).toString("hex")}`;
     const issuedPassword = `Privacy-issued-${randomBytes(9).toString("hex")}-Secure`;
@@ -166,28 +141,31 @@ test.describe("installation privacy boundary", () => {
 
     try {
       await loginAsAdministrator(page, identity.admin, identity.organizationName);
-      await page.getByRole("button", { name: "Настройки организации" }).click();
+      await openSettingsSection(page, "Организация");
       await page.getByRole("textbox", { name: "Название организации" }).fill(updatedOrganization);
-      await page.getByRole("button", { name: "Сохранить" }).click();
-      await expect(page.getByRole("heading", { name: updatedOrganization })).toBeVisible();
+      await page.getByRole("button", { name: "Сохранить название", exact: true }).click();
+      await expect(page.getByRole("heading", { name: updatedOrganization, exact: true })).toBeVisible();
       await expect(page.getByText("Название сохранено.", { exact: true })).toBeVisible();
       organizationChanged = true;
 
-      await page.getByRole("button", { name: "Участники" }).click();
-      await expect(page.getByRole("heading", { name: "Участники" })).toBeVisible();
+      await openSettingsSection(page, "Участники");
+      await expect(page.getByRole("heading", { name: "Участники", exact: true })).toBeVisible();
+      await page.getByRole("button", { name: "Добавить участника", exact: true }).click();
       await page.getByLabel("Логин").fill(memberLogin);
       await page.getByLabel("Пароль").fill(issuedPassword);
       await page.getByRole("button", { name: "Создать участника" }).click();
       await expect(page.getByText("Участник создан. Пароль больше не отображается.", { exact: true })).toBeVisible();
+      await page.getByRole("button", { name: "Добавить участника", exact: true }).click();
       await expect(page.getByLabel("Пароль")).toHaveValue("");
 
-      const memberRow = page.getByRole("listitem").filter({ hasText: memberLogin });
+      const memberRow = page.locator(".member-list-row").filter({ hasText: memberLogin });
+      await expect(memberRow).toHaveCount(1);
       employeeContext = await browser.newContext({ baseURL: applicationOrigin });
       employeeRequests = captureExternalRequests(employeeContext);
       const employeePage = await employeeContext.newPage();
       await login(employeePage, { login: memberLogin, password: issuedPassword });
-      await expect(employeePage.getByRole("heading", { name: updatedOrganization })).toBeVisible();
-      await expect(employeePage.getByRole("status")).toContainText("подключено");
+      await expect(employeePage.getByRole("heading", { name: updatedOrganization, exact: true })).toBeVisible();
+      await expect(employeePage.locator(".connection-status")).toContainText("подключено");
 
       const originalSession = await sessionCookie(employeeContext);
       const crossOriginSocket = io(`${applicationOrigin}/realtime`, {
@@ -211,7 +189,7 @@ test.describe("installation privacy boundary", () => {
       });
       expect(crossOriginConnected).toBe(false);
 
-      await employeePage.getByRole("button", { name: "Настройки аккаунта" }).click();
+      await openSettingsSection(employeePage, "Настройки аккаунта");
       await employeePage.getByRole("textbox", { name: "Текущий пароль" }).fill(issuedPassword);
       await employeePage.getByRole("textbox", { name: "Новый пароль" }).fill(changedPassword);
       await employeePage.getByRole("button", { name: "Сменить пароль" }).click();
@@ -220,15 +198,26 @@ test.describe("installation privacy boundary", () => {
 
       await login(employeePage, { login: memberLogin, password: changedPassword });
       const logoutSession = await sessionCookie(employeeContext);
-      await employeePage.getByRole("button", { name: "Выйти" }).click();
+      await employeePage.getByRole("button", { name: "Выйти" }).click({ timeout: 10_000 });
       await expect(employeePage.getByRole("heading", { name: "Вход" })).toBeVisible();
       await expectRevokedSession(employeeContext, logoutSession, true);
 
-      await memberRow.getByRole("button", { name: "Сбросить пароль" }).click();
+      const openResetForm = memberRow.getByRole("button", { name: "Сбросить пароль", exact: true });
+      await expect(openResetForm).toBeVisible();
+      await expect(openResetForm).toBeEnabled();
+      await openResetForm.click({ timeout: 5_000 });
       await memberRow.getByLabel(`Новый пароль для ${memberLogin}`).fill(resetPassword);
-      await memberRow.getByLabel("Подтверждаю завершение всех входов сотрудника").check();
-      await memberRow.getByRole("button", { name: "Сбросить пароль и завершить входы" }).click();
+      const resetForm = memberRow.locator(".member-reset-form");
+      await expect(resetForm).toBeVisible();
+      const openResetDialog = resetForm.getByRole("button");
+      await expect(openResetDialog).toBeEnabled();
+      await openResetDialog.click({ timeout: 5_000 });
+      const resetDialog = page.getByRole("dialog", { name: "Сбросить пароль" });
+      await resetDialog.getByLabel("Подтверждаю завершение всех входов сотрудника").check();
+      await resetDialog.getByRole("button", { name: "Сбросить пароль и завершить входы" }).click();
       await expect(memberRow.getByRole("status")).toHaveText("Пароль сброшен. Все прежние сеансы завершены.");
+      await memberRow.getByRole("button", { name: "Сбросить пароль" }).click();
+      await expect(memberRow.getByLabel(`Новый пароль для ${memberLogin}`)).toHaveValue("");
       await expect(employeePage.getByRole("heading", { name: "Вход" })).toBeVisible();
       await employeePage.getByLabel("Логин").fill(memberLogin);
       await employeePage.getByLabel("Пароль").fill(changedPassword);
@@ -238,8 +227,9 @@ test.describe("installation privacy boundary", () => {
       await login(employeePage, { login: memberLogin, password: resetPassword });
       const disabledSession = await sessionCookie(employeeContext);
       await memberRow.getByRole("button", { name: "Отключить" }).click();
-      await memberRow.getByLabel("Подтверждаю отключение учётной записи и завершение всех входов").check();
-      await memberRow.getByRole("button", { name: "Подтвердить отключение" }).click();
+      const disableDialog = page.getByRole("dialog", { name: "Отключить участника" });
+      await disableDialog.getByLabel("Подтверждаю отключение учётной записи и завершение всех входов").check();
+      await disableDialog.getByRole("button", { name: "Отключить участника" }).click();
       await expect(memberRow.getByText("Отключён", { exact: true })).toBeVisible();
       await expect(employeePage.getByRole("heading", { name: "Вход" })).toBeVisible();
       await expectRevokedSession(employeeContext, disabledSession);
@@ -251,10 +241,20 @@ test.describe("installation privacy boundary", () => {
     } finally {
       await employeeContext?.close();
       if (organizationChanged) {
-        await page.getByRole("button", { name: "Настройки организации" }).click();
-        await page.getByRole("textbox", { name: "Название организации" }).fill(identity.organizationName);
-        await page.getByRole("button", { name: "Сохранить" }).click();
-        await expect(page.getByText("Название сохранено.", { exact: true })).toBeVisible();
+        const administratorRequest = page.context().request;
+        const csrfResponse = await administratorRequest.get(`${applicationOrigin}/api/auth/csrf`);
+        expect(csrfResponse.status()).toBe(200);
+        const csrfPayload = await csrfResponse.json() as { csrfToken?: unknown };
+        expect(typeof csrfPayload.csrfToken).toBe("string");
+        const response = await administratorRequest.patch(`${applicationOrigin}/api/organization`, {
+          data: { name: identity.organizationName },
+          failOnStatusCode: false,
+          headers: {
+            origin: applicationOrigin,
+            "x-csrf-token": csrfPayload.csrfToken as string
+          }
+        });
+        expect(response.status()).toBe(200);
       }
     }
 

@@ -2,7 +2,9 @@ import { Module, type CanActivate, type ExecutionContext } from "@nestjs/common"
 import { APP_GUARD } from "@nestjs/core";
 import type { Response } from "express";
 import type { Pool } from "pg";
-import { createDatabasePool } from "../db.js";
+import { AccessModule } from "../access/access.module.js";
+import { AccessService } from "../access/access.service.js";
+import { DbModule } from "../db.module.js";
 import { AuthorizationService } from "./authorization.service.js";
 import { AuthController } from "./auth.controller.js";
 import { PasswordService } from "./password.service.js";
@@ -39,21 +41,13 @@ class SessionGuard implements CanActivate {
   }
 }
 
-class DatabasePoolLifecycle {
-  constructor(private readonly pool: Pool) {}
-
-  async onApplicationShutdown(): Promise<void> {
-    await this.pool.end();
-  }
-}
-
 const providers = [
-  { provide: DATABASE_POOL, useFactory: createDatabasePool },
   { provide: PasswordService, useFactory: () => new PasswordService() },
   {
     provide: SessionService,
-    useFactory: (pool: Pool, passwordService: PasswordService) => new SessionService(pool, passwordService),
-    inject: [DATABASE_POOL, PasswordService]
+    useFactory: (pool: Pool, passwordService: PasswordService, access: AccessService) =>
+      new SessionService(pool, passwordService, Date.now, access),
+    inject: [DATABASE_POOL, PasswordService, AccessService]
   },
   {
     provide: SessionRevocationService,
@@ -62,25 +56,21 @@ const providers = [
   },
   {
     provide: AuthorizationService,
-    useFactory: (pool: Pool) => new AuthorizationService(pool),
-    inject: [DATABASE_POOL]
+    useFactory: (access: AccessService) => new AuthorizationService(access),
+    inject: [AccessService]
   },
   {
     provide: APP_GUARD,
     useFactory: (sessions: SessionService) => new SessionGuard(sessions),
     inject: [SessionService]
   },
-  {
-    provide: DatabasePoolLifecycle,
-    useFactory: (pool: Pool) => new DatabasePoolLifecycle(pool),
-    inject: [DATABASE_POOL]
-  }
 ];
 
 export class AuthModule {}
 
 Module({
   controllers: [AuthController],
-  exports: [DATABASE_POOL, SessionService, SessionRevocationService, AuthorizationService],
+  imports: [DbModule, AccessModule],
+  exports: [DbModule, AccessModule, SessionService, SessionRevocationService, AuthorizationService],
   providers
 })(AuthModule);

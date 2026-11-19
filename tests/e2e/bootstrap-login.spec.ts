@@ -61,7 +61,9 @@ test.describe("browser bootstrap and login", () => {
     const meResponse = await context.request.get("/api/auth/me");
     expect(meResponse.status()).toBe(200);
     const me = await meResponse.json() as Record<string, unknown>;
-    expect(Object.keys(me).sort()).toEqual(["id", "login"]);
+    expect(Object.keys(me).sort()).toEqual([
+      "id", "isOwner", "login", "permissions", "roleIds", "roleNames", "roles", "theme", "timezone"
+    ]);
     expect(me.login).toBe(identity.admin.login);
     expect(await page.content()).not.toMatch(/password_hash|passwordHash|csrfToken/iu);
     await context.storageState({ path: storageStatePath });

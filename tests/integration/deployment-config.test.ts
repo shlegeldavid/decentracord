@@ -179,9 +179,9 @@ if (!inContainer) {
       expect(app?.ports).toBeUndefined();
       expect(db?.ports).toBeUndefined();
       expect(JSON.stringify(config)).not.toContain(secretValue);
-      expect(dockerIgnore).toContain(".env");
-      expect(dockerIgnore).toContain(".env.*");
-      expect(dockerIgnore).toContain("secrets");
+      expect(dockerIgnore).toContain("**/.env");
+      expect(dockerIgnore).toContain("**/.env.*");
+      expect(dockerIgnore).toContain("**/secrets");
       expect(envExample).not.toMatch(/^DB_PASSWORD=/mu);
       expect(envExample).not.toMatch(/^SESSION_SECRET=/mu);
 

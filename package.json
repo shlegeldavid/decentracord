@@ -15,11 +15,12 @@
     "typecheck": "tsc --noEmit -p tsconfig.base.json && npm run typecheck --workspace @decentracord/server && npm run typecheck --workspace @decentracord/web",
     "test:doctor": "node --import tsx --test tests/integration/installation-doctor.test.ts",
     "test:integration": "vitest run",
-    "test:e2e": "node --import tsx tests/e2e/fixtures.ts",
+    "test:e2e": "node tests/e2e/run-isolated-groups.mjs",
     "test:e2e:playwright": "playwright test",
     "db:migrate": "docker compose run --rm app migrate"
   },
   "devDependencies": {
+    "@axe-core/playwright": "4.14.0",
     "@playwright/test": "1.65.0",
     "@types/node": "26.6.6",
     "eslint": "10.14.0",

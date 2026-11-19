@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import { test, expect } from "./fixtures.js";
+import { test, expect, openSettingsSection } from "./fixtures.js";
 import type { Browser, BrowserContext, Page } from "@playwright/test";
 
 const storageStatePath = process.env.E2E_STORAGE_STATE_PATH ?? "/e2e-state/session.json";
@@ -13,9 +13,14 @@ async function login(page: Page, credentials: { login: string; password: string 
   await page.getByRole("button", { name: "Войти" }).click();
 }
 
-async function newAuthenticatedPage(browser: Browser, credentials: { login: string; password: string }): Promise<{ context: BrowserContext; page: Page }> {
+async function newAuthenticatedPage(
+  browser: Browser,
+  credentials: { login: string; password: string },
+  observe?: (page: Page) => void
+): Promise<{ context: BrowserContext; page: Page }> {
   const context = await browser.newContext();
   const page = await context.newPage();
+  observe?.(page);
   await login(page, credentials);
   return { context, page };
 }
@@ -50,7 +55,7 @@ test.describe("logout revokes only the current browser session", () => {
       `me=${meResponse.status()} body=${renderedState} browserErrors=${browserErrors.join(" | ")}`
     ).toBeVisible();
     await page.waitForTimeout(1_000);
-    await expect(page.getByRole("status"), `transport=${transportEvents.join(" | ")} browserErrors=${browserErrors.join(" | ")}`).toContainText("подключено");
+    await expect(page.locator(".connection-status"), `transport=${transportEvents.join(" | ")} browserErrors=${browserErrors.join(" | ")}`).toContainText("подключено");
     await expect.poll(() => transportBodies.length).toBeGreaterThan(0);
     expect(transportEvents.some((event) => event.includes("headers GET") && event.includes("transport=polling") && event.includes("origin=<none>") && event.includes("cookie=present"))).toBe(true);
     expect(transportEvents.some((event) => event.includes("headers POST") && event.includes("transport=polling") && event.includes(`origin=${applicationOrigin}`))).toBe(true);
@@ -59,7 +64,7 @@ test.describe("logout revokes only the current browser session", () => {
     const second = await newAuthenticatedPage(browser, identity.admin);
     try {
       await expect(second.page.getByRole("heading", { name: identity.organizationName })).toBeVisible();
-      await expect(second.page.getByRole("status")).toContainText("подключено");
+      await expect(second.page.locator(".connection-status")).toContainText("подключено");
       const sessionCookie = (await context.cookies(applicationOrigin)).find((cookie) => cookie.name.endsWith("decentracord.sid"));
       expect(sessionCookie).toBeTruthy();
       await context.storageState({ path: storageStatePath });
@@ -68,7 +73,7 @@ test.describe("logout revokes only the current browser session", () => {
       await expect(page.getByRole("heading", { name: "Вход" })).toBeVisible();
       await expect(page.getByText(identity.organizationName, { exact: true })).toHaveCount(0);
       await expect(second.page.getByRole("heading", { name: identity.organizationName })).toBeVisible();
-      await expect(second.page.getByRole("status")).toContainText("подключено");
+      await expect(second.page.locator(".connection-status")).toContainText("подключено");
 
       const staleCookieResponse = await context.request.get("/api/auth/me", {
         failOnStatusCode: false,
@@ -89,14 +94,28 @@ test.describe("logout revokes only the current browser session", () => {
 
     const changedPassword = `Changed-password-${Date.now()}-Secure`;
     const first = await newAuthenticatedPage(browser, employee);
-    const second = await newAuthenticatedPage(browser, employee);
+    const secondTransport: string[] = [];
+    const second = await newAuthenticatedPage(browser, employee, (secondPage) => {
+      secondPage.on("response", (response) => {
+        if (!response.url().includes("/socket.io/")) return;
+        const url = new URL(response.url());
+        const transport = url.searchParams.get("transport") ?? "unknown";
+        secondTransport.push(`${response.request().method()} ${response.status()} ${url.pathname} transport=${transport}`);
+      });
+      secondPage.on("requestfailed", (request) => {
+        if (!request.url().includes("/socket.io/")) return;
+        const url = new URL(request.url());
+        const transport = url.searchParams.get("transport") ?? "unknown";
+        secondTransport.push(`failed ${request.failure()?.errorText ?? "unknown"} ${request.method()} ${url.pathname} transport=${transport}`);
+      });
+    });
     const fresh = await browser.newPage();
     try {
       await expect(first.page.getByRole("heading", { name: identity.organizationName })).toBeVisible({ timeout: 10_000 });
       await expect(second.page.getByRole("heading", { name: identity.organizationName })).toBeVisible({ timeout: 10_000 });
-      await expect(first.page.getByRole("status")).toContainText("подключено", { timeout: 10_000 });
-      await expect(second.page.getByRole("status")).toContainText("подключено", { timeout: 10_000 });
-      await first.page.getByRole("button", { name: "Настройки аккаунта" }).click();
+      await expect(first.page.locator(".connection-status")).toContainText("подключено", { timeout: 10_000 });
+      await expect(second.page.locator(".connection-status"), `second transport=${secondTransport.join(" | ")}`).toContainText("подключено", { timeout: 10_000 });
+      await openSettingsSection(first.page, "Настройки аккаунта");
       await expect(first.page.getByRole("heading", { name: "Настройки аккаунта" })).toBeVisible();
 
       await first.page.getByRole("textbox", { name: "Текущий пароль" }).fill(employee.password);

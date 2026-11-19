@@ -19,10 +19,60 @@ const privateApiRoutes = new Set([
   "GET /api/auth/me",
   "GET /api/organization",
   "PATCH /api/organization",
+  "GET /api/organization/logo",
+  "PUT /api/organization/logo",
+  "DELETE /api/organization/logo",
+  "GET /api/organization/read-retention",
+  "PATCH /api/organization/read-retention",
   "GET /api/members",
-  "POST /api/members"
+  "GET /api/members/search",
+  "POST /api/members",
+  "GET /api/roles",
+  "POST /api/roles",
+  "PUT /api/roles/order",
+  "GET /api/channels",
+  "GET /api/channels/subjects",
+  "POST /api/channels/categories",
+  "PUT /api/channels/categories/order",
+  "PUT /api/channels/order",
+  "POST /api/channels",
+  "GET /api/conversations",
+  "POST /api/conversations"
 ]);
 const memberAccessRoute = /^\/api\/members\/[^/]+\/(?:reset-password|disable)$/u;
+const privateApiPatterns: ReadonlyArray<{ method: string; pattern: RegExp }> = [
+  { method: "POST", pattern: memberAccessRoute },
+  { method: "PATCH", pattern: /^\/api\/auth\/preferences$/u },
+  { method: "PATCH", pattern: /^\/api\/roles\/[^/]+$/u },
+  { method: "PATCH", pattern: /^\/api\/members\/[^/]+\/roles$/u },
+  { method: "PATCH", pattern: /^\/api\/channels\/categories\/[^/]+$/u },
+  { method: "DELETE", pattern: /^\/api\/channels\/categories\/[^/]+$/u },
+  { method: "GET", pattern: /^\/api\/channels\/[^/]+$/u },
+  { method: "PATCH", pattern: /^\/api\/channels\/[^/]+$/u },
+  { method: "PUT", pattern: /^\/api\/channels\/[^/]+\/overrides$/u },
+  { method: "POST", pattern: /^\/api\/channels\/[^/]+\/messages$/u },
+  { method: "POST", pattern: /^\/api\/channels\/[^/]+\/messages\/[^/]+\/forward$/u },
+  { method: "POST", pattern: /^\/api\/channels\/[^/]+\/read$/u },
+  { method: "GET", pattern: /^\/api\/channels\/[^/]+\/messages$/u },
+  { method: "GET", pattern: /^\/api\/channels\/[^/]+\/messages\/[^/]+\/readers$/u },
+  { method: "GET", pattern: /^\/api\/channels\/[^/]+\/members$/u },
+  { method: "GET", pattern: /^\/api\/channels\/[^/]+\/pins$/u },
+  { method: "POST", pattern: /^\/api\/channels\/[^/]+\/pins$/u },
+  { method: "DELETE", pattern: /^\/api\/channels\/[^/]+\/pins\/[^/]+$/u },
+  { method: "PATCH", pattern: /^\/api\/channels\/[^/]+\/messages\/[^/]+$/u },
+  { method: "DELETE", pattern: /^\/api\/channels\/[^/]+\/messages\/[^/]+$/u },
+  { method: "GET", pattern: /^\/api\/conversations\/[^/]+$/u },
+  { method: "GET", pattern: /^\/api\/conversations\/[^/]+\/messages$/u },
+  { method: "POST", pattern: /^\/api\/conversations\/[^/]+\/messages$/u },
+  { method: "POST", pattern: /^\/api\/conversations\/[^/]+\/messages\/[^/]+\/forward$/u },
+  { method: "PATCH", pattern: /^\/api\/conversations\/[^/]+\/messages\/[^/]+$/u },
+  { method: "DELETE", pattern: /^\/api\/conversations\/[^/]+\/messages\/[^/]+$/u },
+  { method: "POST", pattern: /^\/api\/conversations\/[^/]+\/read$/u },
+  { method: "POST", pattern: /^\/api\/conversations\/[^/]+\/close$/u },
+  { method: "POST", pattern: /^\/api\/conversations\/[^/]+\/participants$/u },
+  { method: "PATCH", pattern: /^\/api\/conversations\/[^/]+\/participants\/[^/]+$/u },
+  { method: "DELETE", pattern: /^\/api\/conversations\/[^/]+\/participants\/[^/]+$/u }
+];
 
 const genericShell = "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Decentracord</title></head><body><main><h1>Decentracord</h1><p>Войдите, чтобы продолжить.</p></main></body></html>";
 
@@ -281,6 +331,22 @@ async function start(): Promise<void> {
   expressApp.disable("x-powered-by");
   app.use(securityHeaders(publicOrigin));
   app.use(noStoreApiResponse);
+  // Логотип организации приходит сырым PNG: глобальный JSON-парсер ограничен
+  // 32 КБ и PNG не пропускает. Отдельный raw-парсер ставится ДО него, иначе
+  // Nest тела запроса не увидит. `app.use` с проверкой точного пути и метода:
+  // `app.put(...)` в Express 5 перехватил бы маршрут у Nest (роутер Nest
+  // поднимается на `app.init()`, то есть после всех `app.use`).
+  const rawLogoBody = express.raw({
+    type: ["image/png", "application/octet-stream"],
+    limit: "512kb"
+  });
+  app.use((request: Request, response: Response, next: (error?: unknown) => void) => {
+    if (request.method !== "PUT" || request.path !== "/api/organization/logo") {
+      next();
+      return;
+    }
+    rawLogoBody(request, response, next);
+  });
   app.use(express.json({ limit: "32kb", strict: true }));
   const sessions = app.get(SessionService);
   app.use(sessions.createMiddleware());
@@ -289,8 +355,10 @@ async function start(): Promise<void> {
       next();
       return;
     }
-    const route = `${request.method.toUpperCase()} ${request.path}`;
-    if (privateApiRoutes.has(route) || (request.method.toUpperCase() === "POST" && memberAccessRoute.test(request.path))) {
+    const method = request.method.toUpperCase();
+    const route = `${method} ${request.path}`;
+    const patternAllowed = privateApiPatterns.some((entry) => entry.method === method && entry.pattern.test(request.path));
+    if (privateApiRoutes.has(route) || patternAllowed) {
       next();
       return;
     }

@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { request as httpsRequest } from "node:https";
 import { io, type Socket } from "socket.io-client";
-import { test, expect } from "./fixtures.js";
+import { test, expect, openSettingsSection } from "./fixtures.js";
 import type { Browser, BrowserContext, Page, WebSocket } from "@playwright/test";
 
 const testOrigin = process.env.TEST_ORIGIN ?? "https://proxy:443";
@@ -36,8 +36,8 @@ async function authenticatedClient(browser: Browser, credentials: BrowserCredent
   const page = await context.newPage();
   const websocketPromise = page.waitForEvent("websocket", { predicate: isRealtimeWebSocket, timeout: 20_000 });
   await login(page, credentials);
-  await expect(page.getByRole("button", { name: "Настройки аккаунта" })).toBeVisible();
-  await expect(page.getByRole("status")).toContainText("подключено", { timeout: 15_000 });
+  await expect(page.locator(".app-shell")).toBeVisible();
+  await expect(page.locator(".connection-status")).toContainText("подключено", { timeout: 15_000 });
   return { context, page, websocket: await websocketPromise };
 }
 
@@ -103,12 +103,14 @@ async function rejectedByUntrustedCa(): Promise<boolean> {
 }
 
 async function createMember(page: Page, loginValue: string, password: string): Promise<void> {
-  await page.getByRole("button", { name: "Участники" }).click();
-  await expect(page.getByRole("heading", { name: "Участники" })).toBeVisible();
+  await openSettingsSection(page, "Участники");
+  await expect(page.getByRole("heading", { name: "Участники", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Добавить участника", exact: true }).click();
   await page.getByLabel("Логин").fill(loginValue);
   await page.getByLabel("Пароль").fill(password);
   await page.getByRole("button", { name: "Создать участника" }).click();
   await expect(page.getByText("Участник создан. Пароль больше не отображается.", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Добавить участника", exact: true }).click();
   await expect(page.getByLabel("Пароль")).toHaveValue("");
 }
 
@@ -116,16 +118,19 @@ async function resetMember(page: Page, loginValue: string, password: string): Pr
   const row = page.getByRole("listitem").filter({ hasText: loginValue });
   await row.getByRole("button", { name: "Сбросить пароль" }).click();
   await row.getByLabel(`Новый пароль для ${loginValue}`).fill(password);
-  await row.getByLabel("Подтверждаю завершение всех входов сотрудника").check();
-  await row.getByRole("button", { name: "Сбросить пароль и завершить входы" }).click();
+  await row.getByRole("button", { name: "Сбросить пароль" }).click();
+  const resetDialog = page.getByRole("dialog", { name: "Сбросить пароль" });
+  await resetDialog.getByLabel("Подтверждаю завершение всех входов сотрудника").check();
+  await resetDialog.getByRole("button", { name: "Сбросить пароль и завершить входы" }).click();
   await expect(row.getByRole("status")).toHaveText("Пароль сброшен. Все прежние сеансы завершены.");
 }
 
 async function disableMember(page: Page, loginValue: string): Promise<void> {
   const row = page.getByRole("listitem").filter({ hasText: loginValue });
   await row.getByRole("button", { name: "Отключить" }).click();
-  await row.getByLabel("Подтверждаю отключение учётной записи и завершение всех входов").check();
-  await row.getByRole("button", { name: "Подтвердить отключение" }).click();
+  const disableDialog = page.getByRole("dialog", { name: "Отключить участника" });
+  await disableDialog.getByLabel("Подтверждаю отключение учётной записи и завершение всех входов").check();
+  await disableDialog.getByRole("button", { name: "Отключить участника" }).click();
   await expect(row.getByText("Отключён", { exact: true })).toBeVisible();
   await expect(row.getByRole("status")).toHaveText("Учётная запись отключена. Все прежние сеансы завершены.");
 }
@@ -163,7 +168,7 @@ test.describe("trusted TLS session lifecycle", () => {
     const websocketPromise = page.waitForEvent("websocket", { predicate: isRealtimeWebSocket, timeout: 20_000 });
     await login(page, identity.admin);
     await expect(page.getByRole("heading", { name: identity.organizationName })).toBeVisible();
-    await expect(page.getByRole("status")).toContainText("подключено", { timeout: 15_000 });
+    await expect(page.locator(".connection-status")).toContainText("подключено", { timeout: 15_000 });
     const websocket = await websocketPromise;
     expect(new URL(websocket.url()).protocol).toBe("wss:");
     expect(pollingRequests).toContain("GET");
@@ -220,7 +225,7 @@ test.describe("trusted TLS session lifecycle", () => {
     second = await authenticatedClient(browser, { login: memberLogin, password: resetPassword });
     const resetCookies = [await sessionCookie(first.context), await sessionCookie(second.context)];
     const resetWebSockets = [first.websocket, second.websocket];
-    await first.page.getByRole("button", { name: "Настройки аккаунта" }).click();
+    await openSettingsSection(first.page, "Настройки аккаунта");
     await first.page.getByRole("textbox", { name: "Текущий пароль" }).fill(resetPassword);
     await first.page.getByRole("textbox", { name: "Новый пароль" }).fill(changedPassword);
     await first.page.getByRole("button", { name: "Сменить пароль" }).click();

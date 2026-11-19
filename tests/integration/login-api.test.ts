@@ -124,7 +124,7 @@ if (isContainerRunner) {
         });
         noStore(organizationResponse);
         expect(organizationResponse.status).toBe(200);
-        expect(await organizationResponse.json()).toEqual({ name: "Организация" });
+        expect(await organizationResponse.json()).toEqual({ name: "Организация", logoUrl: null });
         return;
       }
 
@@ -256,7 +256,11 @@ if (isContainerRunner) {
       expect(meResponse.status).toBe(200);
       const me = (await meResponse.json()) as Record<string, unknown>;
       expect(me).toMatchObject({ login: adminLogin });
-      expect(Object.keys(me).sort()).toEqual(["id", "login"]);
+      expect(Object.keys(me).sort()).toEqual([
+        "id", "isOwner", "login", "permissions", "roleIds", "roleNames", "roles", "theme", "timezone"
+      ]);
+      expect(me).toMatchObject({ theme: "dark", timezone: null });
+      expect(Array.isArray(me.roles)).toBe(true);
       expect(JSON.stringify(me)).not.toContain("password_hash");
 
       const organizationResponse = await sendApiRequest("/api/organization", {
@@ -264,7 +268,7 @@ if (isContainerRunner) {
       });
       noStore(organizationResponse);
       expect(organizationResponse.status).toBe(200);
-      expect(await organizationResponse.json()).toEqual({ name: "Организация" });
+      expect(await organizationResponse.json()).toEqual({ name: "Организация", logoUrl: null });
 
       writeFileSync(statePath, JSON.stringify({ cookie: loggedInCookie }), { mode: 0o600 });
       chmodSync(statePath, 0o600);

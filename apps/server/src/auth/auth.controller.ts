@@ -1,7 +1,7 @@
-import { Body, Controller, Get, HttpCode, Inject, Post, Req, Res } from "@nestjs/common";
+import { Body, Controller, Get, HttpCode, Inject, Patch, Post, Req, Res } from "@nestjs/common";
 import type { Request, Response } from "express";
 import { SessionRevocationService } from "./session-revocation.service.js";
-import { SessionService, type AuthenticatedRequest } from "./session.service.js";
+import { SessionService, type AuthenticatedRequest, type CurrentUserResponse } from "./session.service.js";
 
 function applyMethodDecorator(
   decorator: MethodDecorator,
@@ -33,11 +33,17 @@ export class AuthController {
     return this.sessions.login(request, body);
   }
 
-  me(request: AuthenticatedRequest): Promise<{ id: string; login: string }> {
+  me(request: AuthenticatedRequest): Promise<CurrentUserResponse> {
     if (!request.authPrincipal) {
       throw new Error("Authenticated principal missing");
     }
     return this.sessions.currentUser(request.authPrincipal);
+  }
+
+  updatePreferences(request: AuthenticatedRequest, value: unknown): Promise<CurrentUserResponse> {
+    const principal = request.authPrincipal;
+    if (!principal) throw new Error("Authenticated principal missing");
+    return this.sessions.updatePreferences(principal, request, value);
   }
 
   async logout(request: AuthenticatedRequest, response: Response): Promise<void> {
@@ -68,6 +74,10 @@ applyParameterDecorator(Req(), AuthController, "login", 0);
 applyParameterDecorator(Body(), AuthController, "login", 1);
 applyMethodDecorator(Get("me"), AuthController.prototype, "me");
 applyParameterDecorator(Req(), AuthController, "me", 0);
+applyMethodDecorator(Patch("preferences"), AuthController.prototype, "updatePreferences");
+applyMethodDecorator(HttpCode(200), AuthController.prototype, "updatePreferences");
+applyParameterDecorator(Req(), AuthController, "updatePreferences", 0);
+applyParameterDecorator(Body(), AuthController, "updatePreferences", 1);
 applyMethodDecorator(Post("logout"), AuthController.prototype, "logout");
 applyMethodDecorator(HttpCode(204), AuthController.prototype, "logout");
 applyParameterDecorator(Req(), AuthController, "logout", 0);

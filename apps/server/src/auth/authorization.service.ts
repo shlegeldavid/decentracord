@@ -1,25 +1,19 @@
-import { HttpException } from "@nestjs/common";
-import type { Pool } from "pg";
+import { AccessService } from "../access/access.service.js";
+import type { Permission } from "../access/permissions.js";
 import type { AuthPrincipal } from "./session.service.js";
 
 export class AuthorizationService {
-  constructor(private readonly pool: Pool) {}
+  constructor(private readonly access: AccessService) {}
 
   async requireAdministrator(principal: AuthPrincipal): Promise<void> {
-    const result = await this.pool.query<{ allowed: boolean }>(
-      `SELECT EXISTS (
-         SELECT 1
-         FROM user_roles AS user_role
-         JOIN roles AS role ON role.id = user_role.role_id
-         WHERE user_role.user_id = $1
-           AND role.system_key = 'administrator'
-           AND role.permissions @> '["ADMINISTRATOR"]'::jsonb
-       ) AS allowed`,
-      [principal.userId]
-    );
+    await this.requirePermission(principal, "ADMINISTRATOR");
+  }
 
-    if (!result.rows[0]?.allowed) {
-      throw new HttpException({ code: "FORBIDDEN", message: "Недостаточно прав" }, 403);
-    }
+  async requirePermission(principal: AuthPrincipal, permission: Permission): Promise<void> {
+    await this.access.requirePermission(principal, permission);
+  }
+
+  async requireOwner(principal: AuthPrincipal): Promise<void> {
+    await this.access.requireOwner(principal);
   }
 }

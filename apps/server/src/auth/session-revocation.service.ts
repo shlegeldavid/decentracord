@@ -3,9 +3,26 @@ import type { AuthenticatedRequest, AuthPrincipal, SessionService } from "./sess
 import type { Socket } from "socket.io";
 
 const maxSocketsPerSession = 10;
-const maxHandshakesPerIp = 30;
+const defaultMaxHandshakesPerIp = 30;
 const handshakeWindowMs = 60_000;
 const maxHandshakeRateKeys = 4_096;
+
+// Предел рукопожатий на адрес нужен против перебора, но браузерные тесты идут
+// с одного адреса стека: им предел поднимается окружением, продукт остаётся на 30.
+function readMaxHandshakesPerIp(): number {
+  const raw = process.env.DECENTRACORD_MAX_SOCKET_HANDSHAKES_PER_IP;
+  if (raw === undefined) return defaultMaxHandshakesPerIp;
+  if (!/^\d{1,6}$/u.test(raw)) throw new Error("Invalid socket handshake limit");
+
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > 100_000) {
+    throw new Error("Invalid socket handshake limit");
+  }
+
+  return value;
+}
+
+const maxHandshakesPerIp = readMaxHandshakesPerIp();
 
 interface EngineRequest extends IncomingMessage {
   _query?: Record<string, string | string[] | undefined>;
@@ -13,7 +30,7 @@ interface EngineRequest extends IncomingMessage {
   sessionID?: string;
 }
 
-interface SocketPrincipalData {
+export interface SocketPrincipalData {
   principal?: AuthPrincipal;
   request?: AuthenticatedRequest;
   reservedSessionId?: string;
@@ -213,6 +230,26 @@ export class SessionRevocationService {
       await revoke();
       this.notifyAndDisconnectUser(userId);
     });
+  }
+
+  async forEachUserConnection(
+    userId: string,
+    action: (socket: Socket, principal: AuthPrincipal) => void | Promise<void>
+  ): Promise<void> {
+    const connections = [...this.sessions.values()]
+      .filter((session) => session.userId === userId)
+      .flatMap((session) => [...session.connections]);
+    for (const connection of connections) {
+      await action(connection.socket, connection.principal);
+    }
+  }
+
+  onlineUserIds(): Set<string> {
+    return new Set(
+      [...this.sessions.values()]
+        .filter((session) => session.connections.size > 0)
+        .map((session) => session.userId)
+    );
   }
 
   /** The only server-side delivery path for protected session events. */

@@ -1,4 +1,4 @@
-import { test, expect, type TestIdentity } from "./fixtures.js";
+import { test, expect, openSettingsSection, type TestIdentity } from "./fixtures.js";
 import type { APIRequestContext, Browser, BrowserContext, Page } from "@playwright/test";
 
 const applicationOrigin = process.env.E2E_BASE_URL ?? "http://decentracord.test:3000";
@@ -56,27 +56,28 @@ test.describe("organization administration", () => {
     const savedName = submittedName.trim();
 
     await loginAsAdmin(page, identity);
-    await page.getByRole("button", { name: "Настройки организации" }).click();
+    await openSettingsSection(page, "Организация");
+    await expect(page.getByRole("button", { name: "Настройки организации", exact: true })).toHaveCount(0);
     const nameInput = page.getByRole("textbox", { name: "Название организации" });
     await expect(nameInput).toHaveValue(identity.organizationName);
     await nameInput.fill(submittedName);
-    await page.getByRole("button", { name: "Сохранить" }).click();
+    await page.getByRole("button", { name: "Сохранить название", exact: true }).click();
     await expect(page.getByText("Название сохранено.", { exact: true })).toBeVisible();
-    await expect(page.getByRole("heading", { name: savedName })).toBeVisible();
+    await expect(page.getByRole("heading", { name: savedName, exact: true })).toBeVisible();
     await expect(page.locator("img[src='x']")).toHaveCount(0);
     expect(await page.evaluate(() => (window as Window & { __organizationXss?: number }).__organizationXss)).toBeUndefined();
 
     await page.reload();
-    await expect(page.getByRole("heading", { name: savedName })).toBeVisible();
+    await expect(page.getByRole("heading", { name: savedName, exact: true })).toBeVisible();
 
     const fresh = await newPage(browser);
     try {
       await fresh.page.goto("/");
       await submitLogin(fresh.page, identity.admin);
-      await expect(fresh.page.getByRole("heading", { name: savedName })).toBeVisible();
-      await fresh.page.getByRole("button", { name: "Настройки организации" }).click();
+      await expect(fresh.page.getByRole("heading", { name: savedName, exact: true })).toBeVisible();
+      await openSettingsSection(fresh.page, "Организация");
       await fresh.page.getByRole("textbox", { name: "Название организации" }).fill(identity.organizationName);
-      await fresh.page.getByRole("button", { name: "Сохранить" }).click();
+      await fresh.page.getByRole("button", { name: "Сохранить название", exact: true }).click();
       await expect(fresh.page.getByText("Название сохранено.", { exact: true })).toBeVisible();
     } finally {
       await fresh.context.close();
@@ -109,8 +110,10 @@ test.describe("organization administration", () => {
       await fresh.page.goto("/");
       const employee = employeeIdentity(identity);
       await submitLogin(fresh.page, employee);
-      await expect(fresh.page.getByRole("heading", { name: identity.organizationName })).toBeVisible();
-      await expect(fresh.page.getByRole("button", { name: "Настройки организации" })).toHaveCount(0);
+      await expect(fresh.page.getByRole("heading", { name: identity.organizationName, exact: true })).toBeVisible();
+      await openSettingsSection(fresh.page, "Настройки аккаунта");
+      const employeeNavigation = fresh.page.getByRole("navigation", { name: "Разделы" });
+      await expect(employeeNavigation.getByRole("button", { name: "Организация", exact: true })).toHaveCount(0);
       const employeeRequest = fresh.context.request;
       const employeeToken = await csrfToken(employeeRequest);
       expect((await patchOrganization(employeeRequest, "Подмена названия", employeeToken)).status()).toBe(403);
@@ -127,12 +130,14 @@ test.describe("organization administration", () => {
     const memberLogin = `created_${Date.now().toString(36)}`;
     const memberPassword = "Member-issued-password-2026";
     await loginAsAdmin(page, identity);
-    await page.getByRole("button", { name: "Участники" }).click();
-    await expect(page.getByRole("heading", { name: "Участники" })).toBeVisible();
+    await openSettingsSection(page, "Участники");
+    await expect(page.getByRole("heading", { name: "Участники", exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Добавить участника", exact: true }).click();
     await page.getByLabel("Логин").fill(memberLogin);
     await page.getByLabel("Пароль").fill(memberPassword);
     await page.getByRole("button", { name: "Создать участника" }).click();
     await expect(page.getByText("Участник создан. Пароль больше не отображается.", { exact: true })).toBeVisible();
+    await page.getByRole("button", { name: "Добавить участника", exact: true }).click();
     await expect(page.getByLabel("Пароль")).toHaveValue("");
     await expect(page.getByText(memberLogin, { exact: true })).toBeVisible();
     expect(await page.content()).not.toContain(memberPassword);
@@ -141,10 +146,11 @@ test.describe("organization administration", () => {
     try {
       await fresh.page.goto("/");
       await submitLogin(fresh.page, { login: memberLogin, password: memberPassword });
-      await expect(fresh.page.getByRole("heading", { name: identity.organizationName })).toBeVisible();
+      await expect(fresh.page.getByRole("heading", { name: identity.organizationName, exact: true })).toBeVisible();
       await expect(fresh.page.getByText(memberLogin, { exact: true })).toBeVisible();
       await expect(fresh.page.getByLabel("Новый пароль")).toHaveCount(0);
-      await expect(fresh.page.getByRole("button", { name: "Участники" })).toHaveCount(0);
+      await openSettingsSection(fresh.page, "Настройки аккаунта");
+      await expect(fresh.page.getByRole("navigation", { name: "Разделы" }).getByRole("button", { name: "Участники", exact: true })).toHaveCount(0);
     } finally {
       await fresh.context.close();
     }
