@@ -13,8 +13,6 @@ import {
   getCsrfToken,
   getCurrentUser,
   getChannels,
-  getConversationMessages,
-  getMessages,
   getOrganization,
   getPinnedMessages,
   listConversations,
@@ -35,7 +33,7 @@ import {
 } from "./api";
 import { MessageComposer } from "./components/MessageComposer";
 import { ForwardMessageDialog } from "./components/ForwardMessageDialog";
-import { MessageFeed, getEarlierMessagePage, type PendingMessage } from "./components/MessageFeed";
+import { MessageFeed, type PendingMessage } from "./components/MessageFeed";
 import { MessageReadersModal } from "./components/MessageReadersModal";
 import { PinnedMessagesPanel } from "./components/PinnedMessagesPanel";
 import { RevokedAccessCard } from "./components/RevokedAccessCard";
@@ -53,19 +51,23 @@ import { PeopleSearch } from "./components/PeopleSearch";
 import { GearIcon } from "./components/icons";
 import { LoginScreen } from "./components/LoginScreen";
 import { SettingsModal, type SettingsSection } from "./components/SettingsModal";
+import { useMessageHistoryPaging, useMessageHistoryState, type ApplyMessageOptions } from "./hooks/useMessageHistory";
 import { useTheme } from "./hooks/useTheme";
 import { useTimezone } from "./hooks/useTimezone";
+import {
+  CHANNEL_SCOPE_PREFIX,
+  CONVERSATION_SCOPE_PREFIX,
+  channelIdFromScope,
+  messageScopeKey,
+  type MessageScope
+} from "./lib/messageHistory";
 import { CONVERSATION_REALTIME, connectRealtime, type RealtimeStatus } from "./realtime";
 import { bindChannelMessageEvents, bindConversationMessageEvents } from "./realtimeMessageEvents";
 import { bindChannelEvents, bindSessionEvents, subscribeToReadableChannels, type ChannelSubscriptions } from "./realtimeWorkspaceEvents";
 
 type ScreenState = "loading" | "guest" | "authenticated";
 type WorkspaceOverlay = "channels" | "members" | null;
-// Область ленты: канал или переписка. Один ключ вместо двух параллельных карт
-// состояний — догон, курсоры и ожидающие сообщения общие для обеих областей.
-type ScopeKey = string;
 type LocalPendingMessage = Omit<PendingMessage, "state"> & { state: PendingMessage["state"] };
-type HistoryLoadState = "loading" | "ready" | "error";
 type RevokedChannel = { id: string; reason: string };
 type OpenDmMenu = { conversationId: string; position: { x: number; y: number } };
 
@@ -147,9 +149,6 @@ function rejectedSendReason(error: unknown): string {
   return error.message || "Отправка отклонена.";
 }
 
-const CHANNEL_SCOPE_PREFIX = "channel:";
-const CONVERSATION_SCOPE_PREFIX = "conversation:";
-
 const scopedMessageRequests = {
   channel: {
     prefix: CHANNEL_SCOPE_PREFIX,
@@ -166,23 +165,10 @@ const scopedMessageRequests = {
   }
 };
 
-type MessageScope = keyof typeof scopedMessageRequests;
-
 // Набор живёт только на клиенте: запись гаснет через 10 с без нового
 // события, отправка ограничена одним событием в 2 с.
 const TYPING_TTL_MS = 10_000;
 const TYPING_THROTTLE_MS = 2_000;
-
-// Ключ области сообщения: ровно одна привязка — канал или переписка.
-function scopeKeyOf(message: MessageView): ScopeKey {
-  return message.conversationId
-    ? `${CONVERSATION_SCOPE_PREFIX}${message.conversationId}`
-    : `${CHANNEL_SCOPE_PREFIX}${message.channelId}`;
-}
-
-function channelIdFromScope(scopeKey: string): string | null {
-  return scopeKey.startsWith(CHANNEL_SCOPE_PREFIX) ? scopeKey.slice(CHANNEL_SCOPE_PREFIX.length) : null;
-}
 
 function createClientRequestId(): string {
   if (typeof globalThis.crypto.randomUUID === "function") return globalThis.crypto.randomUUID();
@@ -223,9 +209,11 @@ export function App() {
   const [dmCollapsed, setDmCollapsed] = useState(readInitialDmCollapsed);
   const [accessDeniedChannelId, setAccessDeniedChannelId] = useState<string | null>(null);
   const [expandedChannelTopicId, setExpandedChannelTopicId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<MessageView[]>([]);
-  const [hasMoreHistory, setHasMoreHistory] = useState(false);
-  const [historyLoadState, setHistoryLoadState] = useState<HistoryLoadState>("ready");
+  const history = useMessageHistoryState();
+  const {
+    messages, hasMoreHistory, historyLoadState, clearHistory, resetHistory, resetHistoryStatus,
+    getMaxAppliedSeq, setSelectedScope, forgetChannelHistory, applyHistoryMessage, markHistoryMessageDeleted
+  } = history;
   const [channelLastReadSeq, setChannelLastReadSeq] = useState<number | undefined>(undefined);
   const [revokedChannel, setRevokedChannel] = useState<RevokedChannel | null>(null);
   const [pendingMessages, setPendingMessages] = useState<LocalPendingMessage[]>([]);
@@ -267,26 +255,16 @@ export function App() {
   const selectedChannelIdRef = useRef<string | null>(null);
   const selectedConversationIdRef = useRef<string | null>(null);
   const conversationsRef = useRef<Conversation[]>([]);
-  const selectedScopeKeyRef = useRef<ScopeKey | null>(null);
   const selectedChannelSnapshotRef = useRef<Channel | null>(null);
   const revokedChannelRef = useRef<RevokedChannel | null>(null);
   // Сообщение, к которому переходим после смены канала: оригинал пересланного
   // сообщения может лежать в другом канале.
   const pendingJumpMessageIdRef = useRef<string | null>(null);
   const pendingMessagesRef = useRef<LocalPendingMessage[]>([]);
-  const messageCursorsRef = useRef(new Map<string, number>());
-  const observedMessageCursorsRef = useRef(new Map<string, number>());
-  const maxAppliedSeqRef = useRef(new Map<string, number>());
-  const catchUpInFlightRef = useRef(new Set<string>());
-  const catchUpRequestedRef = useRef(new Set<string>());
-  const catchUpSessionGenerationRef = useRef(0);
-  const catchUpChannelGenerationRef = useRef(new Map<ScopeKey, number>());
-  const catchUpScopeRequestRef = useRef<(scopeKey: ScopeKey) => void>(() => undefined);
   const unreadCountsRef = useRef<Record<string, number>>({});
   // Время последнего добора списка переписок по событию сообщения в конкретную
   // переписку: не чаще одного запроса в 2 секунды на строку.
   const conversationRefreshAtRef = useRef(new Map<string, number>());
-  const deletedMessageIdsRef = useRef<Set<string>>(new Set());
   const channelSubscriptions = useRef<ChannelSubscriptions>(new Map());
   // Состояние набора живёт только здесь: карта «переписка → кто печатает»
   // с временем истечения и карта времени последней отправки на переписку.
@@ -406,52 +384,11 @@ export function App() {
     setUnreadCounts(next);
   }, []);
 
-  const observeMessageCursor = useCallback((scopeKey: ScopeKey, updatedSeq: number, requestCatchUp = true) => {
-    const currentCursor = messageCursorsRef.current.get(scopeKey) ?? 0;
-    const observedCursor = observedMessageCursorsRef.current.get(scopeKey) ?? currentCursor;
-    observedMessageCursorsRef.current.set(scopeKey, Math.max(observedCursor, updatedSeq));
-    if (updatedSeq <= currentCursor) return false;
-    if (updatedSeq === currentCursor + 1) {
-      messageCursorsRef.current.set(scopeKey, updatedSeq);
-      return false;
-    }
-    if (requestCatchUp && selectedScopeKeyRef.current === scopeKey) {
-      catchUpScopeRequestRef.current(scopeKey);
-    }
-    return true;
-  }, []);
-
-  const applyMessage = useCallback((
-    message: MessageView,
-    options: { requestCatchUpOnGap?: boolean; authoritativeSnapshot?: boolean } = {}
-  ) => {
-    const scopeKey = scopeKeyOf(message);
-    const hasCursorGap = observeMessageCursor(
-      scopeKey,
-      message.updatedSeq,
-      options.requestCatchUpOnGap !== false
-    );
-    if (message.deleted) deletedMessageIdsRef.current.add(message.id);
-    const isTombstoned = deletedMessageIdsRef.current.has(message.id);
-    if ((!hasCursorGap || options.authoritativeSnapshot) && (message.deleted || !isTombstoned)) {
-      const currentMaxSeq = maxAppliedSeqRef.current.get(scopeKey) ?? 0;
-      maxAppliedSeqRef.current.set(scopeKey, Math.max(currentMaxSeq, message.seq));
-    }
-    if (scopeKey === selectedScopeKeyRef.current) {
-      setMessages((current) => {
-        const existing = current.find((entry) => entry.id === message.id);
-        if (!message.deleted && deletedMessageIdsRef.current.has(message.id)) return current;
-        if (!message.deleted && existing && message.updatedSeq <= existing.updatedSeq) return current;
-        const next = current.filter((entry) => entry.id !== message.id && entry.clientRequestId !== message.clientRequestId);
-        const visibleMessage = message.deleted
-          ? { ...message, content: "", mentions: [] }
-          : message;
-        return [...next, visibleMessage].sort((left, right) => left.seq - right.seq);
-      });
-    }
+  const applyMessage = useCallback((message: MessageView, options?: ApplyMessageOptions) => {
+    const hasGap = applyHistoryMessage(message, options);
     updatePendingMessages((current) => current.filter((entry) => entry.clientRequestId !== message.clientRequestId));
-    return hasCursorGap;
-  }, [observeMessageCursor, updatePendingMessages]);
+    return hasGap;
+  }, [applyHistoryMessage, updatePendingMessages]);
 
   const subscribeToChannels = useCallback((items: Channel[]) => {
     subscribeToReadableChannels(realtimeSocket.current, channelSubscriptions.current, items);
@@ -495,62 +432,14 @@ export function App() {
   useEffect(() => {
     selectedChannelIdRef.current = selectedChannelId;
     selectedConversationIdRef.current = selectedConversationId;
-    selectedScopeKeyRef.current = selectedConversationId
-      ? `${CONVERSATION_SCOPE_PREFIX}${selectedConversationId}`
-      : selectedChannelId
-        ? `${CHANNEL_SCOPE_PREFIX}${selectedChannelId}`
-        : null;
-  }, [selectedChannelId, selectedConversationId]);
+    setSelectedScope(selectedConversationId
+      ? messageScopeKey("conversation", selectedConversationId)
+      : selectedChannelId ? messageScopeKey("channel", selectedChannelId) : null);
+  }, [selectedChannelId, selectedConversationId, setSelectedScope]);
 
-  const applyHistoryPage = useCallback((
-    scopeKey: ScopeKey,
-    page: { messages: MessageView[]; cursor: number },
-    options: { preserveCurrent?: boolean } = {}
-  ) => {
-    if (!options.preserveCurrent) {
-      const currentCursor = messageCursorsRef.current.get(scopeKey) ?? 0;
-      const nextCursor = Math.max(currentCursor, page.cursor);
-      messageCursorsRef.current.set(scopeKey, nextCursor);
-      const observedCursor = observedMessageCursorsRef.current.get(scopeKey) ?? 0;
-      observedMessageCursorsRef.current.set(scopeKey, Math.max(observedCursor, nextCursor));
-      if (selectedScopeKeyRef.current === scopeKey && observedCursor > nextCursor) {
-        catchUpScopeRequestRef.current(scopeKey);
-      }
-    }
-    for (const message of page.messages) {
-      const currentMaxSeq = maxAppliedSeqRef.current.get(scopeKey) ?? 0;
-      maxAppliedSeqRef.current.set(scopeKey, Math.max(currentMaxSeq, message.seq));
-      if (message.deleted) deletedMessageIdsRef.current.add(message.id);
-    }
-    if (selectedScopeKeyRef.current !== scopeKey) return;
-
-    setMessages((current) => {
-      const next = new Map<string, MessageView>();
-      for (const message of page.messages) {
-        if (message.deleted) {
-          next.set(message.id, { ...message, content: "", mentions: [] });
-        } else if (!deletedMessageIdsRef.current.has(message.id)) {
-          next.set(message.id, message);
-        }
-      }
-      for (const message of current) {
-        if (scopeKeyOf(message) !== scopeKey) continue;
-        if (message.deleted) {
-          const pageMessage = next.get(message.id);
-          if (!pageMessage || message.updatedSeq > pageMessage.updatedSeq) next.set(message.id, message);
-          continue;
-        }
-        if (deletedMessageIdsRef.current.has(message.id)) continue;
-        const pageMessage = next.get(message.id);
-        if (pageMessage) {
-          if (message.updatedSeq > pageMessage.updatedSeq) next.set(message.id, message);
-        } else if (options.preserveCurrent || message.updatedSeq > page.cursor) {
-          next.set(message.id, message);
-        }
-      }
-      return Array.from(next.values()).sort((left, right) => left.seq - right.seq);
-    });
-  }, []);
+  useEffect(() => {
+    if (!selectedChannelId) setChannelLastReadSeq(undefined);
+  }, [selectedChannelId]);
 
   const clearPrivateSession = useCallback(() => {
     realtimeSocket.current?.disconnect();
@@ -565,23 +454,13 @@ export function App() {
     setExpandedChannelTopicId(null);
     selectedChannelIdRef.current = null;
     selectedConversationIdRef.current = null;
-    selectedScopeKeyRef.current = null;
     selectedChannelSnapshotRef.current = null;
     revokedChannelRef.current = null;
     setRevokedChannel(null);
-    setMessages([]);
-    setHasMoreHistory(false);
-    setHistoryLoadState("ready");
+    resetHistory();
     setChannelLastReadSeq(undefined);
     setPendingMessages([]);
     pendingMessagesRef.current = [];
-    catchUpSessionGenerationRef.current += 1;
-    catchUpInFlightRef.current.clear();
-    catchUpRequestedRef.current.clear();
-    catchUpChannelGenerationRef.current.clear();
-    messageCursorsRef.current.clear();
-    observedMessageCursorsRef.current.clear();
-    maxAppliedSeqRef.current.clear();
     unreadCountsRef.current = {};
     setUnreadCounts({});
     setConversations([]);
@@ -600,7 +479,6 @@ export function App() {
     document.title = "Decentracord";
     setMessageInput("");
     setMessageError(null);
-    deletedMessageIdsRef.current = new Set();
     channelSubscriptions.current.clear();
     typingRef.current.clear();
     typingSentAtRef.current.clear();
@@ -617,7 +495,7 @@ export function App() {
     setRealtimeStatus("disconnected");
     setScreen("guest");
     void getCsrfToken().then(setCsrfToken).catch(() => setCsrfToken(null));
-  }, []);
+  }, [resetHistory]);
 
   // Общий путь применения списка переписок: и полный ответ сервера, и добор по
   // сигналу `conversations: null`. Исчезновение открытой переписки — признак
@@ -670,9 +548,7 @@ export function App() {
     selectedChannelSnapshotRef.current = null;
     setAccessDeniedChannelId(null);
     setExpandedChannelTopicId(null);
-    setMessages([]);
-    setHasMoreHistory(false);
-    setHistoryLoadState("ready");
+    clearHistory();
     // Счётчик строки сбрасывается сразу; серверный курсор прочтения двигает
     // эффект применения первой страницы истории.
     setConversations((current) => current.map((conversation) => conversation.id === conversationId
@@ -680,7 +556,7 @@ export function App() {
       : conversation));
     setHiddenConversationId(null);
     setHiddenConversationSnapshot(null);
-  }, []);
+  }, [clearHistory]);
 
   const startConversationWith = useCallback(async (participantId: string): Promise<void> => {
     if (!csrfToken) throw new Error("Не удалось подготовить защищённый запрос");
@@ -691,7 +567,7 @@ export function App() {
 
   const markReadThroughAppliedMessages = useCallback((channelId: string) => {
     if (!csrfToken) return;
-    const seq = maxAppliedSeqRef.current.get(`${CHANNEL_SCOPE_PREFIX}${channelId}`) ?? 0;
+    const seq = getMaxAppliedSeq(messageScopeKey("channel", channelId));
     void markChannelRead(channelId, seq, csrfToken).then(() => {
       const nextChannels = channelsRef.current.map((channel) => channel.id === channelId
         ? { ...channel, lastReadSeq: Math.max(channel.lastReadSeq ?? 0, seq) }
@@ -701,18 +577,18 @@ export function App() {
     }).catch((error: unknown) => {
       if (error instanceof ApiError && error.status === 401) clearPrivateSession();
     });
-  }, [csrfToken, clearPrivateSession]);
+  }, [csrfToken, clearPrivateSession, getMaxAppliedSeq]);
 
   // Курсор прочтения переписки: тот же путь, что у канала, но по области
   // `conversation:<id>`. Счётчик строки уже равен нулю, поэтому результат
   // пересчитывать не нужно — `Conversation` не отдаёт `lastReadSeq`.
   const markConversationReadThroughApplied = useCallback((conversationId: string) => {
     if (!csrfToken) return;
-    const seq = maxAppliedSeqRef.current.get(`${CONVERSATION_SCOPE_PREFIX}${conversationId}`) ?? 0;
+    const seq = getMaxAppliedSeq(messageScopeKey("conversation", conversationId));
     void markConversationRead(conversationId, seq, csrfToken).catch((error: unknown) => {
       if (error instanceof ApiError && error.status === 401) clearPrivateSession();
     });
-  }, [csrfToken, clearPrivateSession]);
+  }, [csrfToken, clearPrivateSession, getMaxAppliedSeq]);
 
   const selectChannel = useCallback((channelId: string) => {
     const channel = channelsRef.current.find((item) => item.id === channelId);
@@ -724,16 +600,13 @@ export function App() {
     setChannelLastReadSeq(channel.lastReadSeq ?? 0);
     revokedChannelRef.current = null;
     setRevokedChannel(null);
-    if (changedChannel) {
-      setHistoryLoadState("loading");
-      setHasMoreHistory(false);
-    }
+    if (changedChannel) resetHistoryStatus("loading");
     selectedChannelIdRef.current = channelId;
     setSelectedChannelId(channelId);
     setSelectedConversationId(null);
     setChannelUnreadCount(channelId, 0);
     markReadThroughAppliedMessages(channelId);
-  }, [markReadThroughAppliedMessages, setChannelUnreadCount]);
+  }, [markReadThroughAppliedMessages, resetHistoryStatus, setChannelUnreadCount]);
 
   const leaveRevokedChannel = useCallback(() => {
     revokedChannelRef.current = null;
@@ -742,8 +615,8 @@ export function App() {
     selectedChannelIdRef.current = null;
     setSelectedChannelId(null);
     setChannelLastReadSeq(undefined);
-    setHasMoreHistory(false);
-  }, []);
+    resetHistoryStatus();
+  }, [resetHistoryStatus]);
 
   const toggleSidebarCollapsed = useCallback(() => {
     setAccessDeniedChannelId(null);
@@ -825,140 +698,30 @@ export function App() {
     };
   }, [closeOverlay, openOverlay, settingsOpen]);
 
-  const loadHistoryPage = useCallback(async (
-    kind: "channel" | "conversation",
-    id: string,
-    before: number | undefined
-  ) => {
-    const isChannel = kind === "channel";
-    const scopeKey = `${isChannel ? CHANNEL_SCOPE_PREFIX : CONVERSATION_SCOPE_PREFIX}${id}`;
-    const selectedId = isChannel ? selectedChannelIdRef : selectedConversationIdRef;
-    const isRevoked = () => isChannel && revokedChannelRef.current?.id === id;
-    const isInitialPage = before === undefined;
-    if (isRevoked()) {
-      if (isInitialPage) setHistoryLoadState("ready");
-      return;
-    }
-    if (isInitialPage) setHistoryLoadState("loading");
-
-    try {
-      const page = isChannel
-        ? await getEarlierMessagePage(id, before)
-        : await getConversationMessages(id, isInitialPage ? { limit: 50 } : { before, limit: 50 });
-      if (selectedId.current !== id || isRevoked()) return;
-      applyHistoryPage(scopeKey, page, { preserveCurrent: true });
-      setHasMoreHistory(page.hasMore);
-      if (isInitialPage) setHistoryLoadState("ready");
-      if (!isChannel) {
-        markConversationReadThroughApplied(id);
-      } else if (isInitialPage) {
-        markReadThroughAppliedMessages(id);
-      }
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        clearPrivateSession();
-        return;
-      }
-      if (isInitialPage) setHistoryLoadState("error");
-      throw error;
-    }
-  }, [applyHistoryPage, clearPrivateSession, markConversationReadThroughApplied, markReadThroughAppliedMessages]);
+  const clearMessageDraft = useCallback(() => {
+    setMessageInput("");
+    setMessageError(null);
+  }, []);
+  const { catchUp, loadHistoryPage } = useMessageHistoryPaging({
+    history,
+    channelId: selectedChannelId,
+    conversationId: selectedConversationId,
+    channelIdRef: selectedChannelIdRef,
+    conversationIdRef: selectedConversationIdRef,
+    channelsRef,
+    revokedChannelRef,
+    applyMessage,
+    markChannelRead: markReadThroughAppliedMessages,
+    markConversationRead: markConversationReadThroughApplied,
+    clearDraft: clearMessageDraft,
+    reportError: setMessageError,
+    onSessionExpired: clearPrivateSession
+  });
 
   const loadEarlierMessages = useCallback(async (before: number | undefined) => {
     const channelId = selectedChannelIdRef.current;
-    if (!channelId) return;
-    await loadHistoryPage("channel", channelId, before);
+    if (channelId) await loadHistoryPage("channel", channelId, before);
   }, [loadHistoryPage]);
-
-  const loadConversationEarlier = useCallback((conversationId: string, before: number | undefined) =>
-    loadHistoryPage("conversation", conversationId, before), [loadHistoryPage]);
-
-  const catchUp = useCallback(async (kind: "channel" | "conversation", id: string) => {
-    const isChannel = kind === "channel";
-    const scopeKey = `${isChannel ? CHANNEL_SCOPE_PREFIX : CONVERSATION_SCOPE_PREFIX}${id}`;
-    const selectedId = isChannel ? selectedChannelIdRef : selectedConversationIdRef;
-    const isSelected = () => selectedId.current === id;
-    const canApply = () => isSelected() && (!isChannel || revokedChannelRef.current?.id !== id);
-    const getPage = isChannel ? getMessages : getConversationMessages;
-    const markRead = isChannel ? markReadThroughAppliedMessages : markConversationReadThroughApplied;
-    if (isChannel && !channelsRef.current.some((channel) => channel.id === id && channel.canView)) return;
-    if (catchUpInFlightRef.current.has(scopeKey)) {
-      catchUpRequestedRef.current.add(scopeKey);
-      return;
-    }
-    catchUpInFlightRef.current.add(scopeKey);
-    const sessionGeneration = catchUpSessionGenerationRef.current;
-    const scopeGeneration = catchUpChannelGenerationRef.current.get(scopeKey) ?? 0;
-    const isCurrentRun = () =>
-      sessionGeneration === catchUpSessionGenerationRef.current &&
-      scopeGeneration === (catchUpChannelGenerationRef.current.get(scopeKey) ?? 0);
-    const canApplyRun = () => isCurrentRun() && canApply();
-    let cursor = messageCursorsRef.current.get(scopeKey);
-    let completed = false;
-    try {
-      if (cursor === undefined) {
-        if (!canApplyRun()) return;
-        const latestPage = await getPage(id, { limit: 50 });
-        if (!canApplyRun()) return;
-        applyHistoryPage(scopeKey, latestPage);
-        setHasMoreHistory(latestPage.hasMore);
-        cursor = messageCursorsRef.current.get(scopeKey);
-      }
-      if (cursor === undefined) return;
-
-      while (canApplyRun()) {
-        const page = await getPage(id, { after: cursor, limit: 200 });
-        if (!canApplyRun()) return;
-        for (const message of page.messages) {
-          applyMessage(message, { requestCatchUpOnGap: false, authoritativeSnapshot: true });
-        }
-        const currentCursor = messageCursorsRef.current.get(scopeKey) ?? cursor;
-        const nextCursor = Math.max(cursor, currentCursor, page.cursor);
-        messageCursorsRef.current.set(scopeKey, nextCursor);
-        const observedCursor = observedMessageCursorsRef.current.get(scopeKey) ?? nextCursor;
-        observedMessageCursorsRef.current.set(scopeKey, Math.max(observedCursor, nextCursor));
-        if (nextCursor <= cursor) break;
-        cursor = nextCursor;
-        if (page.messages.length < 200 && observedCursor <= cursor) break;
-      }
-      completed = true;
-      if (canApplyRun()) markRead(id);
-    } finally {
-      if (isCurrentRun()) {
-        catchUpInFlightRef.current.delete(scopeKey);
-        const retryRequested = catchUpRequestedRef.current.delete(scopeKey);
-        const currentCursor = messageCursorsRef.current.get(scopeKey) ?? 0;
-        const observedCursor = observedMessageCursorsRef.current.get(scopeKey) ?? currentCursor;
-        if (completed && retryRequested && observedCursor > currentCursor && isSelected()) {
-          queueMicrotask(() => catchUpScopeRequestRef.current(scopeKey));
-        }
-      }
-    }
-  }, [applyHistoryPage, applyMessage, markReadThroughAppliedMessages, markConversationReadThroughApplied]);
-
-  const catchUpChannel = useCallback((channelId: string) => catchUp("channel", channelId), [catchUp]);
-  const catchUpConversation = useCallback((conversationId: string) => catchUp("conversation", conversationId), [catchUp]);
-
-  useEffect(() => {
-    catchUpScopeRequestRef.current = (scopeKey) => {
-      const conversationId = scopeKey.startsWith(CONVERSATION_SCOPE_PREFIX)
-        ? scopeKey.slice(CONVERSATION_SCOPE_PREFIX.length)
-        : null;
-      const run = conversationId
-        ? catchUpConversation(conversationId)
-        : (() => {
-            const channelId = channelIdFromScope(scopeKey);
-            return channelId ? catchUpChannel(channelId) : Promise.resolve();
-          })();
-      void run.catch((error: unknown) => {
-        if (error instanceof ApiError && error.status === 401) {
-          clearPrivateSession();
-          return;
-        }
-        if (selectedScopeKeyRef.current === scopeKey) setMessageError("Не удалось обновить переписку");
-      });
-    };
-  }, [catchUpChannel, catchUpConversation, clearPrivateSession]);
 
   const setPendingDelivery = useCallback((clientRequestId: string, delivery: Pick<PendingMessage, "state" | "reason">) => {
     updatePendingMessages((current) => current.map((message) => message.clientRequestId === clientRequestId
@@ -1045,23 +808,13 @@ export function App() {
       const revoked = { id: channelId, reason };
       revokedChannelRef.current = revoked;
       setRevokedChannel(revoked);
-      setHasMoreHistory(false);
-      setHistoryLoadState("ready");
+      resetHistoryStatus();
     };
     const clearUnavailableChannels = (items: Channel[]) => {
       const readableChannelIds = new Set(items.filter((channel) => channel.canView).map((channel) => channel.id));
       for (const channel of channelsRef.current) {
         if (readableChannelIds.has(channel.id)) continue;
-        if (channel.canView) {
-          const scopeKey = `${CHANNEL_SCOPE_PREFIX}${channel.id}` as const;
-          const generation = catchUpChannelGenerationRef.current.get(scopeKey) ?? 0;
-          catchUpChannelGenerationRef.current.set(scopeKey, generation + 1);
-          catchUpInFlightRef.current.delete(scopeKey);
-          messageCursorsRef.current.delete(scopeKey);
-          observedMessageCursorsRef.current.delete(scopeKey);
-          maxAppliedSeqRef.current.delete(scopeKey);
-          catchUpRequestedRef.current.delete(scopeKey);
-        }
+        if (channel.canView) forgetChannelHistory(channel.id);
         channelSubscriptions.current.delete(channel.id);
       }
       updatePendingMessages((current) => current.filter((message) => {
@@ -1179,13 +932,6 @@ export function App() {
       }
     }
 
-    const removeRealtimeMessage = (scopeKey: ScopeKey, messageId: string, updatedSeq: number) => {
-      deletedMessageIdsRef.current.add(messageId);
-      observeMessageCursor(scopeKey, updatedSeq);
-      setMessages((current) => current.map((message) => message.id === messageId
-        ? { ...message, updatedSeq, deleted: true, content: "", mentions: [] }
-        : message));
-    };
     const setRealtimePin = (messageId: string, pinned: boolean) => {
       setPinnedMessageIds((current) => {
         if (current.has(messageId) === pinned) return current;
@@ -1225,7 +971,7 @@ export function App() {
       isSelected: (channelId) => selectedChannelIdRef.current === channelId,
       apply: applyMessage,
       remove: ({ scopeId, messageId, updatedSeq }) =>
-        removeRealtimeMessage(`${CHANNEL_SCOPE_PREFIX}${scopeId}`, messageId, updatedSeq),
+        markHistoryMessageDeleted(messageId, { scopeKey: messageScopeKey("channel", scopeId), updatedSeq }),
       markRead: markReadThroughAppliedMessages,
       incrementUnread: (channelId) => setChannelUnreadCount(channelId, (unreadCountsRef.current[channelId] ?? 0) + 1),
       setPinned: setRealtimePin
@@ -1235,7 +981,7 @@ export function App() {
       isSelected: (conversationId) => selectedConversationIdRef.current === conversationId,
       onCreated: onConversationMessage,
       remove: ({ scopeId, messageId, updatedSeq }) =>
-        removeRealtimeMessage(`${CONVERSATION_SCOPE_PREFIX}${scopeId}`, messageId, updatedSeq),
+        markHistoryMessageDeleted(messageId, { scopeKey: messageScopeKey("conversation", scopeId), updatedSeq }),
       replaceConversations: applyConversations,
       refreshConversations,
       clearUnread: (conversationId) => setConversations((current) => current.map((conversation) =>
@@ -1271,44 +1017,7 @@ export function App() {
         realtimeSocket.current = null;
       }
     };
-  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUp, refreshConversations, csrfToken, replaceUnreadCounts, setChannelUnreadCount, submitScopedMessage, updatePendingMessages, markReadThroughAppliedMessages, markConversationReadThroughApplied, applyConversations, observeMessageCursor]);
-
-  useEffect(() => {
-    const channelId = selectedChannelId;
-    setMessages([]);
-    setHasMoreHistory(false);
-    setMessageInput("");
-    setMessageError(null);
-    if (!channelId) {
-      setHistoryLoadState("ready");
-      setChannelLastReadSeq(undefined);
-      return;
-    }
-
-    setHistoryLoadState("loading");
-    void loadEarlierMessages(undefined).catch(() => undefined);
-  }, [selectedChannelId, loadEarlierMessages]);
-
-  // Открытие переписки: лента перезагружается так же, как при смене канала.
-  useEffect(() => {
-    const conversationId = selectedConversationId;
-    if (!conversationId) {
-      // Канал ведёт собственный эффект: сброс нужен только когда ничего не выбрано.
-      if (selectedChannelIdRef.current === null) {
-        setMessages([]);
-        setHasMoreHistory(false);
-        setHistoryLoadState("ready");
-      }
-      return;
-    }
-
-    setMessages([]);
-    setHasMoreHistory(false);
-    setMessageInput("");
-    setMessageError(null);
-    setHistoryLoadState("loading");
-    void loadConversationEarlier(conversationId, undefined).catch(() => undefined);
-  }, [selectedConversationId, loadConversationEarlier]);
+  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUp, refreshConversations, csrfToken, replaceUnreadCounts, setChannelUnreadCount, submitScopedMessage, updatePendingMessages, markReadThroughAppliedMessages, markConversationReadThroughApplied, applyConversations, forgetChannelHistory, markHistoryMessageDeleted, resetHistoryStatus]);
 
   // Закрепления канала: при смене канала множество очищается и загружается заново.
   useEffect(() => {
@@ -1474,10 +1183,7 @@ export function App() {
     try {
       await scopedMessageRequests[kind].remove(id, messageId, csrfToken);
       if (selectedId.current !== id) return;
-      deletedMessageIdsRef.current.add(messageId);
-      setMessages((current) => current.map((message) => message.id === messageId
-        ? { ...message, deleted: true, content: "", mentions: [] }
-        : message));
+      markHistoryMessageDeleted(messageId);
     } catch (error) {
       const apiError = error instanceof ApiError ? error : null;
       if (apiError?.status === 401) {
@@ -1493,7 +1199,7 @@ export function App() {
         ? "Недостаточно прав для удаления этого сообщения"
         : apiError?.message ?? "Не удалось удалить сообщение.");
     }
-  }, [csrfToken, clearPrivateSession]);
+  }, [csrfToken, clearPrivateSession, markHistoryMessageDeleted]);
 
   const canEditMessage = useCallback((message: MessageView) => {
     const createdAt = new Date(message.createdAt).getTime();
@@ -1734,9 +1440,7 @@ export function App() {
     if (selectedConversationIdRef.current === conversationId) {
       setSelectedConversationId(null);
       selectedConversationIdRef.current = null;
-      setMessages([]);
-      setHasMoreHistory(false);
-      setHistoryLoadState("ready");
+      clearHistory();
       setHiddenConversationId(null);
       setHiddenConversationSnapshot(null);
     }
@@ -2030,7 +1734,7 @@ export function App() {
                           setSelectedConversationId(null);
                           setHiddenConversationId(null);
                           setHiddenConversationSnapshot(null);
-                          setMessages([]);
+                          clearHistory();
                         }}
                       />
                     )}
@@ -2038,7 +1742,7 @@ export function App() {
                       {...feedProps}
                       channelId={openConversation.id}
                       hasMoreHistory={hasMoreHistory}
-                      onLoadEarlier={(before) => loadConversationEarlier(openConversation.id, before)}
+                      onLoadEarlier={(before) => loadHistoryPage("conversation", openConversation.id, before)}
                       messages={messages.filter((message) => message.conversationId === openConversation.id)}
                       canManageMessages={false}
                       onRetry={(clientRequestId) => handleRetryMessage("conversation", clientRequestId)}
