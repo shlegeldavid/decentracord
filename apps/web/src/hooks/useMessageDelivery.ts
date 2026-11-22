@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useState } from "react";
 import type { RefObject } from "react";
 import {
   ApiError,
@@ -11,17 +11,11 @@ import {
   type Channel,
   type MessageView
 } from "../api.js";
-import type { PendingMessage } from "../components/PendingMessageList";
-import {
-  channelIdFromScope,
-  messageScopeKey,
-  scopeKeyOf,
-  type MessageScope
-} from "../lib/messageHistory.js";
+import { messageScopeKey, type MessageScope } from "../lib/messageHistory.js";
+import { MessageOutbox, type PendingMessage } from "../lib/messageOutbox.js";
 import type { RealtimeStatus } from "../realtime.js";
 import type { ApplyMessageOptions } from "./useMessageHistory";
 
-type PendingEntry = PendingMessage & { attempt?: symbol };
 type MessageChange =
   | { type: "edit"; messageId: string; content: string }
   | { type: "delete"; messageId: string };
@@ -62,14 +56,10 @@ function changeError(error: ApiError | null, kind: MessageScope, change: Message
 }
 
 export function useMessageQueue() {
-  const entries = useRef(new Map<string, PendingEntry>());
   const [pendingMessages, setPendingMessages] = useState<PendingMessage[]>([]);
-  const publish = useCallback(() => { setPendingMessages([...entries.current.values()]); }, []);
-  const resetQueue = useCallback(() => {
-    entries.current = new Map();
-    publish();
-  }, [publish]);
-  return { entries, pendingMessages, publish, resetQueue };
+  const [outbox] = useState(() => new MessageOutbox(setPendingMessages));
+  const resetQueue = useCallback(() => outbox.reset(), [outbox]);
+  return { outbox, pendingMessages, resetQueue };
 }
 
 type MessageDeliveryOptions = {
@@ -103,34 +93,26 @@ export function useMessageDelivery({
   onError,
   onSessionExpired
 }: MessageDeliveryOptions) {
-  const { entries, publish } = queue;
+  const { outbox } = queue;
   const selectedId = useCallback((kind: MessageScope) =>
     (kind === "channel" ? channelIdRef : conversationIdRef).current,
   [channelIdRef, conversationIdRef]);
 
   const applyMessage = useCallback((message: MessageView, options?: ApplyMessageOptions) => {
     const hasGap = applyHistoryMessage(message, options);
-    const pending = entries.current.get(message.clientRequestId);
-    if (message.authorId === currentUserId && pending?.scopeKey === scopeKeyOf(message)) {
-      entries.current.delete(message.clientRequestId);
-      publish();
-    }
+    outbox.acknowledge(message, currentUserId);
     return hasGap;
-  }, [applyHistoryMessage, currentUserId, entries, publish]);
+  }, [applyHistoryMessage, currentUserId, outbox]);
 
   const send = useCallback(async (kind: MessageScope, id: string, entry: PendingMessage, token: string) => {
-    const session = entries.current;
-    const { clientRequestId, scopeKey, content } = entry;
-    const attempt = Symbol();
-    session.set(clientRequestId, { clientRequestId, scopeKey, content, state: "sending", attempt });
-    publish();
+    const attempt = outbox.startSending(entry);
     if (selectedId(kind) === id) onError(null);
 
     try {
       const message = await requests[kind].send(id, entry, token);
-      if (entries.current === session && session.has(clientRequestId)) applyMessage(message);
+      if (outbox.awaitsDelivery(attempt)) applyMessage(message);
     } catch (error) {
-      if (entries.current !== session) return;
+      if (!attempt.isCurrent()) return;
       const apiError = error instanceof ApiError ? error : null;
       if (apiError?.status === 401) {
         onSessionExpired();
@@ -138,112 +120,75 @@ export function useMessageDelivery({
       }
 
       const rejected = apiError?.status === 403 || apiError?.status === 404;
-      const current = session.get(clientRequestId);
-      if (current?.attempt !== attempt || current.state === "rejected") return;
-      // Переотправка канала уже запланирована. Сохраняем лишь явный отказ сервера.
-      if (kind === "channel" && current.state === "queued" && !rejected) return;
-      const state = rejected ? "rejected" : isSocketConnected() ? "failed" : "queued";
       const reason = rejectionReason(apiError, kind);
-      session.set(clientRequestId, { ...current, state, ...(rejected ? { reason } : {}) });
-      publish();
+      const state = outbox.recordFailure(kind, attempt, rejected ? { rejected, reason } : { rejected, isConnected: isSocketConnected });
       if (state === "failed" && selectedId(kind) === id) {
         const denied = kind === "channel" && apiError?.code === "SEND_NOT_ALLOWED";
         onError(denied ? reason : apiError?.message ?? "Не удалось отправить сообщение. Попробуйте ещё раз.");
       }
     }
-  }, [applyMessage, entries, isSocketConnected, onError, onSessionExpired, publish, selectedId]);
+  }, [applyMessage, isSocketConnected, onError, onSessionExpired, outbox, selectedId]);
+
+  const sendOrQueue = useCallback((kind: MessageScope, id: string, entry: PendingMessage, token: string) => {
+    if (realtimeStatus === "connected" && isSocketConnected()) void send(kind, id, entry, token);
+    else outbox.enqueue(entry);
+  }, [isSocketConnected, outbox, realtimeStatus, send]);
 
   const submit = useCallback((kind: MessageScope, content: string, token: string) => {
     const id = selectedId(kind);
     if (!id) return;
     clearComposer();
-    const clientRequestId = createClientRequestId();
-    const entry: PendingMessage = { clientRequestId, scopeKey: messageScopeKey(kind, id), content, state: "queued" };
-    if (realtimeStatus === "connected" && isSocketConnected()) {
-      void send(kind, id, entry, token);
-    } else {
-      entries.current.set(clientRequestId, entry);
-      publish();
-    }
-  }, [clearComposer, entries, isSocketConnected, publish, realtimeStatus, selectedId, send]);
+    const entry: PendingMessage = {
+      clientRequestId: createClientRequestId(), scopeKey: messageScopeKey(kind, id), content, state: "queued"
+    };
+    sendOrQueue(kind, id, entry, token);
+  }, [clearComposer, selectedId, sendOrQueue]);
 
   const retry = useCallback((kind: MessageScope, clientRequestId: string) => {
-    const entry = entries.current.get(clientRequestId);
-    const prefix = messageScopeKey(kind, "");
-    if (!entry?.scopeKey.startsWith(prefix) || !csrfToken) return;
-    const id = entry.scopeKey.slice(prefix.length);
-    if (!id) return;
-    if (realtimeStatus === "connected" && isSocketConnected()) {
-      void send(kind, id, entry, csrfToken);
-    } else {
-      entries.current.set(clientRequestId, { ...entry, state: "queued" });
-      publish();
-    }
-  }, [csrfToken, entries, isSocketConnected, publish, realtimeStatus, send]);
+    const retry = outbox.retryEntry(kind, clientRequestId);
+    if (retry && csrfToken) sendOrQueue(kind, retry.scopeId, retry.entry, csrfToken);
+  }, [csrfToken, outbox, sendOrQueue]);
 
-  const requeueSending = useCallback(() => {
-    for (const [id, entry] of entries.current) {
-      if (entry.state === "sending") entries.current.set(id, { ...entry, state: "queued" });
-    }
-    publish();
-  }, [entries, publish]);
-
-  const dropUnreadableChannels = useCallback((readableIds: ReadonlySet<string>) => {
-    for (const [id, entry] of entries.current) {
-      const channelId = channelIdFromScope(entry.scopeKey);
-      if (channelId !== null && !readableIds.has(channelId)) entries.current.delete(id);
-    }
-    publish();
-  }, [entries, publish]);
-
+  const requeueSending = useCallback(() => outbox.requeueSending(), [outbox]);
+  const dropUnreadableChannels = useCallback((readableIds: ReadonlySet<string>) => outbox.dropUnreadableChannels(readableIds), [outbox]);
   const rejectChannel = useCallback((channelId: string, error: unknown) => {
-    const scopeKey = messageScopeKey("channel", channelId);
-    const reason = rejectionReason(error instanceof ApiError ? error : null, "channel");
-    for (const [id, entry] of entries.current) {
-      if (entry.scopeKey === scopeKey && (entry.state === "queued" || entry.state === "sending")) {
-        entries.current.set(id, { ...entry, state: "rejected", reason });
-      }
-    }
-    publish();
-  }, [entries, publish]);
+    outbox.rejectChannel(channelId, rejectionReason(error instanceof ApiError ? error : null, "channel"));
+  }, [outbox]);
 
   const replayChannels = useCallback(async (canReplay: () => boolean) => {
     if (!csrfToken) return;
-    const session = entries.current;
-    for (const entry of [...session.values()]) {
-      if (entries.current !== session || !canReplay()) break;
-      if (entry.state !== "queued" || session.get(entry.clientRequestId) !== entry) continue;
-      const id = channelIdFromScope(entry.scopeKey);
-      if (!id || !channelsRef.current.some((channel) => channel.id === id && channel.canView)) continue;
-      await send("channel", id, entry, csrfToken);
-    }
-  }, [channelsRef, csrfToken, entries, send]);
+    await outbox.replayChannels({
+      canReplay,
+      canView: (id) => channelsRef.current.some((channel) => channel.id === id && channel.canView),
+      send: (id, entry) => send("channel", id, entry, csrfToken)
+    });
+  }, [channelsRef, csrfToken, outbox, send]);
 
   const changeMessage = useCallback(async (kind: MessageScope, change: MessageChange): Promise<boolean> => {
     const id = selectedId(kind);
     if (!id || !csrfToken) return false;
-    const session = entries.current;
+    const isCurrent = outbox.captureSession();
     onError(null);
     try {
       if (change.type === "edit") {
         const updated = await requests[kind].edit(id, change.messageId, change.content, csrfToken);
-        if (entries.current !== session) return false;
+        if (!isCurrent()) return false;
         applyMessage(updated);
         return true;
       }
 
       await requests[kind].remove(id, change.messageId, csrfToken);
-      if (entries.current !== session || selectedId(kind) !== id) return false;
+      if (!isCurrent() || selectedId(kind) !== id) return false;
       markHistoryMessageDeleted(change.messageId);
       return true;
     } catch (error) {
-      if (entries.current !== session) return false;
+      if (!isCurrent()) return false;
       const apiError = error instanceof ApiError ? error : null;
       if (apiError?.status === 401) onSessionExpired();
       else if (selectedId(kind) === id) onError(changeError(apiError, kind, change));
       return false;
     }
-  }, [applyMessage, csrfToken, entries, markHistoryMessageDeleted, onError, onSessionExpired, selectedId]);
+  }, [applyMessage, csrfToken, markHistoryMessageDeleted, onError, onSessionExpired, outbox, selectedId]);
 
   return {
     applyMessage,
