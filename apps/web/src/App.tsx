@@ -2208,558 +2208,552 @@ export function App() {
     );
   }
 
-  if (screen === "authenticated" && user && organization && csrfToken) {
+  if (screen !== "authenticated" || !user || !organization || !csrfToken) {
     return (
-      <main ref={appShellRef} className="app-shell">
-        <AppHeader
-          organizationName={organization.name}
-          logoUrl={organization.logoUrl ?? null}
-          realtimeStatus={realtimeStatus}
-          theme={theme}
-          onToggleTheme={toggleTheme}
-          onReconnect={() => realtimeSocket.current?.connect()}
-          onOpenSettings={() => {
-            setAccessDeniedChannelId(null);
-            setSettingsOpen(true);
-          }}
-          onOpenChannels={() => openOverlayFromTrigger("channels")}
-          onOpenMembers={() => openOverlayFromTrigger("members")}
-          peopleSearch={(
-            <PeopleSearch
-              onSessionExpired={clearPrivateSession}
-              onStartConversation={(person) => startConversationWith(person.id)}
-              currentUserId={user.id}
-            />
-          )}
-        />
-        {errorMessage && <p className="form-error workspace-alert" role="alert">{errorMessage}</p>}
-
-        <div className="workspace-grid">
-          <ChannelSidebar
-            channels={channels}
-            categories={categories}
-            dmSection={(
-              <DmSection
-                conversations={conversations}
-                selectedConversationId={selectedConversationId}
-                currentUserId={user.id}
-                typingByConversation={typingByConversation}
-                collapsed={dmCollapsed}
-                onToggleCollapsed={toggleDmCollapsed}
-                onCreate={() => setCreateDmOpen(true)}
-                onSelect={(conversationId) => {
-                  selectConversation(conversationId);
-                  if (openOverlay === "channels") closeOverlay();
-                }}
-                onCloseRequest={handleOpenDmMenu}
-                status={conversationsStatus}
-                onRetry={() => void refreshConversations()}
-              />
-            )}
-            canManageChannels={canManageChannels}
-            onCreateChannel={handleOpenCreateChannel}
-            onCreateCategory={async (name) => {
-              const validationError = categoryNameValidationError(name);
-              if (validationError) throw new Error(validationError);
-              if (!csrfToken) throw new Error("Не удалось подготовить защищённый запрос");
-              try {
-                await createCategory(name, csrfToken);
-                const channelData = await getChannels();
-                setCategories(channelData.categories);
-              } catch (error) {
-                throw new Error(requestError(error));
-              }
-            }}
-            onCategoryError={setErrorMessage}
-            onReorderItem={(item, target) => void handleReorderItem(item, target)}
-            dragAnnouncement={dragAnnouncement}
-            onOpenCategoryMenu={handleOpenCategoryMenu}
-            openCategoryMenuId={openCategoryMenuId}
-            onOpenChannelMenu={handleOpenChannelMenu}
-            openChannelMenuId={openChannelMenuId}
-            selectedChannelId={selectedChannelId}
-            unreadCounts={unreadCounts}
-            collapsedCategoryIds={collapsedCategoryIds}
-            uncategorizedCollapsed={uncategorizedCollapsed}
-            onToggleCategoryCollapsed={toggleCategoryCollapsed}
-            onToggleUncategorizedCollapsed={toggleUncategorizedCollapsed}
-            onSelect={selectChannel}
-            onAccessDenied={(channelId) => {
-              setAccessDeniedChannelId((current) => current === channelId ? null : channelId);
-            }}
-            sidebarWidth={sidebarWidth}
-            collapsed={sidebarCollapsed}
-            onToggleCollapsed={toggleSidebarCollapsed}
-            onSidebarWidthChange={updateSidebarWidth}
-            onSidebarWidthCommit={saveSidebarWidth}
-            user={user}
-            isOnline={realtimeStatus === "connected"}
-            onLogout={() => void handleLogout()}
-            isLoggingOut={isLoggingOut}
-            isOverlayOpen={openOverlay === "channels"}
-            onCloseOverlay={closeOverlay}
-            {...(openOverlay === "channels" ? { dialogRef: setOverlayPanelElement } : {})}
-          />
-          {channelForMenu && (
-            <ChannelMenu
-              name={channelForMenu.name}
-              trigger={channelMenuTriggerRef.current}
-              canEditProperties={channelForMenu.ownerEditable}
-              onProperties={() => openChannelProperties(channelForMenu)}
-              onMove={() => setMoveChannelTarget(channelForMenu)}
-              onClose={() => setOpenChannelMenuId(null)}
-            />
-          )}
-          {dmMenu && (
-            <div
-              ref={dmMenuRef}
-              className="context-menu"
-              role="menu"
-              aria-label="Действия с перепиской"
-              style={{ left: dmMenu.position.x, top: dmMenu.position.y }}
-              onKeyDown={(event) => {
-                if (event.key !== "Escape") return;
-                event.preventDefault();
-                closeDmMenuAndRestoreFocus(dmMenu.conversationId);
-              }}
-            >
-              <button
-                type="button"
-                role="menuitem"
-                className="context-menu-item"
-                onClick={() => void handleCloseConversation(dmMenu.conversationId)}
-              >
-                <span>Закрыть переписку</span>
-              </button>
-            </div>
-          )}
-          {moveChannelTarget && (
-            <MoveToCategoryMenu
-              open
-              channelName={moveChannelTarget.name}
-              currentCategoryId={moveChannelTarget.categoryId}
-              categories={categories}
-              onClose={closeMoveChannelDialog}
-              onMove={handleMoveChannel}
-            />
-          )}
-          <CreateChannelModal
-            open={createChannelTarget !== undefined}
-            category={createChannelTarget ?? null}
-            onClose={() => setCreateChannelTarget(undefined)}
-            onCreate={handleCreateChannel}
-            onSessionExpired={clearPrivateSession}
-          />
-          <CreateDmDialog
-            open={createDmOpen}
-            onClose={() => setCreateDmOpen(false)}
-            csrfToken={csrfToken}
-            onCreated={(conversation) => {
-              void refreshConversations();
-              selectConversation(conversation.id);
-            }}
-            onSessionExpired={clearPrivateSession}
-          />
-          {selectedConversation?.kind === "group" && (
-            <AddDmMembersDialog
-              open={addDmMembersOpen}
-              onClose={() => setAddDmMembersOpen(false)}
-              conversation={selectedConversation}
-              csrfToken={csrfToken}
-              onAdded={(announcement) => {
-                setDmMembersAnnouncement(announcement);
-                void refreshConversations();
-              }}
-              onSessionExpired={clearPrivateSession}
-            />
-          )}
-          {channelPropertiesTarget && (
-            <ChannelPropertiesModal
-              open
-              channelId={channelPropertiesTarget.id}
-              categories={categories}
-              csrfToken={csrfToken}
-              canManage={channelPropertiesTarget.ownerEditable}
-              onClose={() => setChannelPropertiesTarget(null)}
-              onSessionExpired={clearPrivateSession}
-              onSaved={() => {
-                void getChannels().then((data) => {
-                  if (screen !== "authenticated") return;
-                  channelsRef.current = data.channels;
-                  setChannels(data.channels);
-                  setCategories(data.categories);
-                  replaceUnreadCounts(data.channels, true);
-                }).catch((refreshError: unknown) => {
-                  if (refreshError instanceof ApiError && refreshError.status === 401) {
-                    clearPrivateSession();
-                    return;
-                  }
-                  setErrorMessage("Не удалось обновить данные канала. Обновите страницу и попробуйте снова.");
-                });
-              }}
-            />
-          )}
-          {categoryForMenu && (
-            <ChannelCategoryMenu
-              name={categoryForMenu.name}
-              trigger={categoryMenuTriggerRef.current}
-              expanded={!collapsedCategoryIds.has(categoryForMenu.id)}
-              canMoveUp={!isReorderingCategories && categories.findIndex((category) => category.id === categoryForMenu.id) > 0}
-              canMoveDown={!isReorderingCategories && categories.findIndex((category) => category.id === categoryForMenu.id) < categories.length - 1}
-              onToggle={() => toggleCategoryCollapsed(categoryForMenu.id)}
-              onRename={() => setRenameCategoryTarget(categoryForMenu)}
-              onDelete={() => {
-                setDeleteCategoryError(undefined);
-                setDeleteCategoryTarget(categoryForMenu);
-              }}
-              onMoveUp={() => void handleReorderCategory(categoryForMenu.id, -1)}
-              onMoveDown={() => void handleReorderCategory(categoryForMenu.id, 1)}
-              onClose={() => setOpenCategoryMenuId(null)}
-            />
-          )}
-          <CategoryDialog
-            open={renameCategoryTarget !== null}
-            onClose={closeRenameCategoryDialog}
-            mode="rename"
-            {...(renameCategoryTarget ? { initialName: renameCategoryTarget.name } : {})}
-            onSubmit={async (name) => {
-              const validationError = categoryNameValidationError(name);
-              if (validationError) throw new Error(validationError);
-              if (!csrfToken || !renameCategoryTarget) throw new Error("Не удалось подготовить защищённый запрос");
-              try {
-                const updated = await renameCategoryRequest(renameCategoryTarget.id, name, csrfToken);
-                setCategories((current) => current.map((entry) => entry.id === updated.id ? updated : entry));
-              } catch (error) {
-                throw new Error(requestError(error));
-              }
-            }}
-            onError={setErrorMessage}
-          />
-          <ConfirmDialog
-            open={deleteCategoryTarget !== null}
-            title={`Удалить категорию «${deleteCategoryTarget?.name ?? ""}»`}
-            description="Каналы этой категории перейдут в раздел «Без категории». Переписка не пропадёт."
-            confirmCheckboxLabel="Подтверждаю удаление категории и перенос её каналов в «Без категории»"
-            confirmLabel="Удалить"
-            onConfirm={confirmDeleteCategory}
-            onCancel={closeDeleteCategoryDialog}
-            busy={isDeletingCategory}
-            {...(deleteCategoryError ? { errorMessage: deleteCategoryError } : {})}
-          />
-          <div className="workspace-content" inert={openOverlay !== null}>
-            <div className="chat-pane">
-              <section className="settings-card workspace-message-panel" aria-labelledby="workspace-messages-title">
-                <header className="chat-pane-header">
-                  {openConversation ? (
-                    <DmHeader conversation={openConversation} currentUserId={user.id} />
-                  ) : (
-                    <>
-                  <span className="channel-hash" aria-hidden="true">#</span>
-                  <h2 id="workspace-messages-title">
-                    <button
-                      type="button"
-                      className="channel-name-trigger"
-                      aria-expanded={pinsOpen}
-                      aria-controls="channel-pins-panel"
-                      onClick={() => {
-                        if (!selectedChannel?.canView) return;
-                        setPinsOpen(true);
-                      }}
-                    >
-                      {selectedChannel?.name ?? "Выберите канал"}
-                    </button>
-                  </h2>
-                  {selectedChannel?.canView && selectedChannel.description && (
-                    <button
-                      type="button"
-                      className="channel-topic"
-                      aria-expanded={expandedChannelTopicId === selectedChannel.id}
-                      aria-controls={`channel-topic-expanded-${selectedChannel.id}`}
-                      onClick={() => setExpandedChannelTopicId((current) => current === selectedChannel.id ? null : selectedChannel.id)}
-                    >
-                      {selectedChannel.description}
-                    </button>
-                  )}
-                  {selectedChannel?.visibility === "known" && (
-                    <span className="channel-mode-badge">Известен всем, но закрыт</span>
-                  )}
-                  {selectedChannel?.ownerEditable && (
-                    <button
-                      type="button"
-                      className="icon-btn channel-properties-trigger"
-                      aria-label="Свойства канала"
-                      onClick={() => openChannelProperties(selectedChannel)}
-                    >
-                      <GearIcon />
-                    </button>
-                  )}
-                    </>
-                  )}
-                </header>
-                {selectedChannel?.canView && selectedChannel.description && (
-                  <div
-                    id={`channel-topic-expanded-${selectedChannel.id}`}
-                    className="channel-topic-expanded"
-                    hidden={expandedChannelTopicId !== selectedChannel.id}
-                  >
-                    {selectedChannel.description}
-                  </div>
-                )}
-                {accessDeniedChannelId && (
-                  <p className="channel-access-hint" role="status" aria-live="polite">Нет доступа к этому каналу</p>
-                )}
-                <span className="visually-hidden" aria-live="polite">{dmAnnouncement}</span>
-                <span className="visually-hidden" aria-live="polite">{dmMembersAnnouncement}</span>
-                {openConversation ? (
-                  <>
-                    <div className="message-stage">
-                      {isConversationHidden && (
-                        <DmHiddenCard
-                          onBack={() => {
-                            setSelectedConversationId(null);
-                            setHiddenConversationId(null);
-                            setHiddenConversationSnapshot(null);
-                            setMessages([]);
-                          }}
-                        />
-                      )}
-                      <MessageFeed
-                        channelId={openConversation.id}
-                        hasMoreHistory={hasMoreHistory}
-                        historyLoadState={historyLoadState}
-                        onLoadEarlier={(before) => loadConversationEarlier(openConversation.id, before)}
-                        messages={messages.filter((message) => message.conversationId === openConversation.id)}
-                        pending={pendingMessages.filter((message) =>
-                          message.scopeKey === `${CONVERSATION_SCOPE_PREFIX}${openConversation.id}`)}
-                        currentUserId={user.id}
-                        canManageMessages={false}
-                        theme={theme}
-                        timeZone={timeZone}
-                        dayKey={dayKey}
-                        formatMessageTime={formatMessageTime}
-                        onRetry={retryConversationMessage}
-                        onEdit={handleEditConversationMessage}
-                        onDelete={(messageId) => void handleDeleteConversationMessage(messageId)}
-                        canEdit={(message) => message.authorId === user.id}
-                        canDelete={(message) => message.authorId === user.id}
-                        onForward={(message) => {
-                          if (message.conversationId === null) return;
-                          setForwardTarget({ source: { kind: "conversation", id: message.conversationId }, message });
-                        }}
-                        showDelivery
-                        emptyState={{
-                          heading: "Это начало переписки — напишите первое",
-                          body: openConversation.kind === "direct"
-                            ? "Отправьте первое сообщение — его увидит собеседник."
-                            : "Отправьте первое сообщение — его увидят участники переписки."
-                        }}
-                      />
-                    </div>
-                    {!isConversationHidden && (
-                      <>
-                        <TypingIndicator label={selectedConversationId ? typingLabelFor(selectedConversationId) : null} />
-                        <MessageComposer
-                          value={messageInput}
-                          onChange={setMessageInput}
-                          onInput={() => {
-                            if (selectedConversationId) emitTyping(selectedConversationId);
-                          }}
-                          onSubmit={(content, token) => handleComposerSubmit("conversation", content, token)}
-                          disabled={false}
-                          offline={realtimeStatus !== "connected"}
-                          csrfToken={csrfToken}
-                          isSending={pendingMessages.some((message) =>
-                            message.scopeKey === `${CONVERSATION_SCOPE_PREFIX}${openConversation.id}` &&
-                            message.state === "sending")}
-                          errorMessage={messageError}
-                        />
-                      </>
-                    )}
-                  </>
-                ) : selectedChannel ? (
-                  <>
-                    <div className="message-stage">
-                      <MessageFeed
-                        channelId={selectedChannel.id}
-                        hasMoreHistory={hasMoreHistory && !isSelectedChannelRevoked}
-                        historyLoadState={historyLoadState}
-                        lastReadSeq={channelLastReadSeq ?? 0}
-                        isRevoked={isSelectedChannelRevoked}
-                        onLoadEarlier={loadEarlierMessages}
-                        messages={messages.filter((message) => message.channelId === selectedChannel.id)}
-                        pending={pendingMessages
-                          .filter((message) => message.scopeKey === `${CHANNEL_SCOPE_PREFIX}${selectedChannel.id}`)
-                          .map((message) => message)}
-                        currentUserId={user.id}
-                        canManageMessages={canManageMessages}
-                        theme={theme}
-                        timeZone={timeZone}
-                        dayKey={dayKey}
-                        formatMessageTime={formatMessageTime}
-                        onJumpToUnread={() => {
-                          const article = document.querySelector<HTMLElement>(
-                            '.message-feed [data-first-unread="true"]'
-                          );
-                          article?.scrollIntoView({ behavior: "auto", block: "start" });
-                          article?.focus({ preventScroll: true });
-                        }}
-                        onRetry={handleRetryMessage}
-                        onEdit={handleEditMessage}
-                        onDelete={(messageId) => void handleDeleteMessage(messageId)}
-                        canEdit={canEditMessage}
-                        canSeeReaders={(message) => message.authorId === user.id}
-                        onOpenReaders={(message) => {
-                          if (message.channelId === null) return;
-                          openReaders(message.channelId, message.id);
-                        }}
-                        canPin={canManageMessages}
-                        canUnpin={(message) => canManageMessages || message.authorId === user.id}
-                        isPinned={(messageId) => pinnedMessageIds.has(messageId)}
-                        onPin={(message) => void handlePinMessage(message)}
-                        onUnpin={(message) => void handleUnpinMessage(message.id)}
-                        onForward={(message) => {
-                          if (message.channelId === null) return;
-                          setForwardTarget({ source: { kind: "channel", id: message.channelId }, message });
-                        }}
-                        visibleChannelIds={visibleChannelIds}
-                        onJumpToMessage={jumpToForwardedMessage}
-                      />
-                      {selectedChannel.canView && (
-                        <PinnedMessagesPanel
-                          open={pinsOpen}
-                          onClose={() => setPinsOpen(false)}
-                          channelId={selectedChannel.id}
-                          canManageMessages={canManageMessages}
-                          currentUserId={user.id}
-                          pinnedMessageIds={pinnedMessageIds}
-                          onUnpin={handleUnpinMessage}
-                          onJumpToMessage={jumpToPinnedMessage}
-                          timeZone={timeZone}
-                          theme={theme}
-                          onSessionExpired={clearPrivateSession}
-                        />
-                      )}
-                      {isSelectedChannelRevoked && revokedChannel && (
-                        <RevokedAccessCard reason={revokedChannel.reason} onBack={leaveRevokedChannel} />
-                      )}
-                      <MessageReadersModal
-                        open={readersMessage !== null}
-                        onClose={() => setReadersMessage(null)}
-                        channelId={readersMessage?.channelId ?? ""}
-                        messageId={readersMessage?.messageId ?? ""}
-                        timeZone={timeZone}
-                        onSessionExpired={clearPrivateSession}
-                      />
-                    </div>
-                    {!isSelectedChannelRevoked && (
-                      <MessageComposer
-                        value={messageInput}
-                        onChange={setMessageInput}
-                        onSubmit={(content, token) => handleComposerSubmit("channel", content, token)}
-                        disabled={!selectedChannel.canSend}
-                        {...(!selectedChannel.canSend ? { disabledReason: "канал только для чтения" } : {})}
-                        offline={realtimeStatus !== "connected"}
-                        csrfToken={csrfToken}
-                        isSending={pendingMessages.some((message) =>
-                          message.scopeKey === `${CHANNEL_SCOPE_PREFIX}${selectedChannel.id}` && message.state === "sending")}
-                        errorMessage={messageError}
-                      />
-                    )}
-                  </>
-                ) : (
-                  <p className="settings-copy channel-selection-hint">Выберите канал слева, чтобы открыть переписку.</p>
-                )}
-                {/* Диалог пересылки общий для обеих областей: источник может быть
-                    и каналом, и перепиской. */}
-                {forwardTarget && (
-                  <ForwardMessageDialog
-                    open
-                    onClose={() => setForwardTarget(null)}
-                    source={forwardTarget.source}
-                    message={forwardTarget.message}
-                    channels={channels}
-                    categories={categories}
-                    conversations={conversations}
-                    currentUserId={user.id}
-                    onForward={handleForwardMessage}
-                    timeZone={timeZone}
-                  />
-                )}
-                <span className="visually-hidden" aria-live="polite">{forwardAnnouncement}</span>
-              </section>
-            </div>
-          </div>
-          <div
-            ref={openOverlay === "members" ? setOverlayPanelElement : undefined}
-            className={`members-panel${openOverlay === "members" ? " drawer drawer-right is-open" : ""}`}
-            {...(openOverlay === "members"
-              ? {
-                role: "dialog",
-                "aria-modal": true,
-                "aria-label": openConversation ? "Участники переписки" : "Состав канала",
-                tabIndex: -1
-              }
-              : {})}
-          >
-            {openConversation ? (
-              <DmMembersPanel
-                conversation={selectedConversation}
-                currentUserId={user.id}
-                csrfToken={csrfToken}
-                onMembersChanged={() => void refreshConversations()}
-                onOpenAddMembers={() => setAddDmMembersOpen(true)}
-                onSessionExpired={clearPrivateSession}
-              />
-            ) : (
-              <ChannelMembersPanel channelId={selectedChannelId} theme={theme} />
-            )}
-          </div>
-          {openOverlay && <div className="overlay" aria-hidden="true" onClick={closeOverlay} />}
-        </div>
-        <SettingsModal
-          open={settingsOpen}
-          onClose={() => setSettingsOpen(false)}
-          section={settingsSection}
-          onSectionChange={(section) => {
-            setAccessDeniedChannelId(null);
-            setSettingsSection(section);
-          }}
-          csrfToken={csrfToken}
-          user={user}
-          organizationName={organization.name}
-          organizationLogoUrl={organization.logoUrl ?? null}
-          onOrganizationSaved={(name) => {
-            // Переименование не должно убирать логотип из шапки.
-            setOrganization((current) => current ? { ...current, name } : { name, logoUrl: null });
-          }}
-          onLogoChanged={() => {
-            void getOrganization().then(setOrganization).catch(() => undefined);
-          }}
-          onUserUpdated={setUser}
-          canManageRoles={canManageRoles}
-          canManageChannels={canManageChannels}
-          isAdministrator={isAdministrator}
-          onSessionExpired={clearPrivateSession}
-          onPasswordChanged={handlePasswordChanged}
-          theme={theme}
-          onThemeChange={setTheme}
-        />
-      </main>
+      <LoginScreen
+        loginValue={loginValue}
+        passwordValue={password}
+        onLoginChange={setLoginValue}
+        onPasswordChange={setPassword}
+        onSubmit={(event) => void handleSubmit(event)}
+        loginInputRef={loginInput}
+        isSubmitting={isSubmitting}
+        canSubmit={Boolean(csrfToken)}
+        errorMessage={errorMessage}
+        successMessage={successMessage}
+      />
     );
   }
 
+  const activeScope = openConversation
+    ? `${CONVERSATION_SCOPE_PREFIX}${openConversation.id}`
+    : selectedChannel ? `${CHANNEL_SCOPE_PREFIX}${selectedChannel.id}` : null;
+  const activePending = pendingMessages.filter((message) => message.scopeKey === activeScope);
+  const feedProps = {
+    currentUserId: user.id,
+    historyLoadState,
+    pending: activePending,
+    theme,
+    timeZone,
+    dayKey,
+    formatMessageTime
+  };
+  const composerProps = {
+    value: messageInput,
+    onChange: setMessageInput,
+    offline: realtimeStatus !== "connected",
+    csrfToken,
+    isSending: activePending.some((message) => message.state === "sending"),
+    errorMessage: messageError
+  };
+
   return (
-    <LoginScreen
-      loginValue={loginValue}
-      passwordValue={password}
-      onLoginChange={setLoginValue}
-      onPasswordChange={setPassword}
-      onSubmit={(event) => void handleSubmit(event)}
-      loginInputRef={loginInput}
-      isSubmitting={isSubmitting}
-      canSubmit={Boolean(csrfToken)}
-      errorMessage={errorMessage}
-      successMessage={successMessage}
-    />
+    <main ref={appShellRef} className="app-shell">
+      <AppHeader
+        organizationName={organization.name}
+        logoUrl={organization.logoUrl ?? null}
+        realtimeStatus={realtimeStatus}
+        theme={theme}
+        onToggleTheme={toggleTheme}
+        onReconnect={() => realtimeSocket.current?.connect()}
+        onOpenSettings={() => {
+          setAccessDeniedChannelId(null);
+          setSettingsOpen(true);
+        }}
+        onOpenChannels={() => openOverlayFromTrigger("channels")}
+        onOpenMembers={() => openOverlayFromTrigger("members")}
+        peopleSearch={(
+          <PeopleSearch
+            onSessionExpired={clearPrivateSession}
+            onStartConversation={(person) => startConversationWith(person.id)}
+            currentUserId={user.id}
+          />
+        )}
+      />
+      {errorMessage && <p className="form-error workspace-alert" role="alert">{errorMessage}</p>}
+
+      <div className="workspace-grid">
+        <ChannelSidebar
+          channels={channels}
+          categories={categories}
+          dmSection={(
+            <DmSection
+              conversations={conversations}
+              selectedConversationId={selectedConversationId}
+              currentUserId={user.id}
+              typingByConversation={typingByConversation}
+              collapsed={dmCollapsed}
+              onToggleCollapsed={toggleDmCollapsed}
+              onCreate={() => setCreateDmOpen(true)}
+              onSelect={(conversationId) => {
+                selectConversation(conversationId);
+                if (openOverlay === "channels") closeOverlay();
+              }}
+              onCloseRequest={handleOpenDmMenu}
+              status={conversationsStatus}
+              onRetry={() => void refreshConversations()}
+            />
+          )}
+          canManageChannels={canManageChannels}
+          onCreateChannel={handleOpenCreateChannel}
+          onCreateCategory={async (name) => {
+            const validationError = categoryNameValidationError(name);
+            if (validationError) throw new Error(validationError);
+            if (!csrfToken) throw new Error("Не удалось подготовить защищённый запрос");
+            try {
+              await createCategory(name, csrfToken);
+              const channelData = await getChannels();
+              setCategories(channelData.categories);
+            } catch (error) {
+              throw new Error(requestError(error));
+            }
+          }}
+          onCategoryError={setErrorMessage}
+          onReorderItem={(item, target) => void handleReorderItem(item, target)}
+          dragAnnouncement={dragAnnouncement}
+          onOpenCategoryMenu={handleOpenCategoryMenu}
+          openCategoryMenuId={openCategoryMenuId}
+          onOpenChannelMenu={handleOpenChannelMenu}
+          openChannelMenuId={openChannelMenuId}
+          selectedChannelId={selectedChannelId}
+          unreadCounts={unreadCounts}
+          collapsedCategoryIds={collapsedCategoryIds}
+          uncategorizedCollapsed={uncategorizedCollapsed}
+          onToggleCategoryCollapsed={toggleCategoryCollapsed}
+          onToggleUncategorizedCollapsed={toggleUncategorizedCollapsed}
+          onSelect={selectChannel}
+          onAccessDenied={(channelId) => {
+            setAccessDeniedChannelId((current) => current === channelId ? null : channelId);
+          }}
+          sidebarWidth={sidebarWidth}
+          collapsed={sidebarCollapsed}
+          onToggleCollapsed={toggleSidebarCollapsed}
+          onSidebarWidthChange={updateSidebarWidth}
+          onSidebarWidthCommit={saveSidebarWidth}
+          user={user}
+          isOnline={realtimeStatus === "connected"}
+          onLogout={() => void handleLogout()}
+          isLoggingOut={isLoggingOut}
+          isOverlayOpen={openOverlay === "channels"}
+          onCloseOverlay={closeOverlay}
+          {...(openOverlay === "channels" ? { dialogRef: setOverlayPanelElement } : {})}
+        />
+        {channelForMenu && (
+          <ChannelMenu
+            name={channelForMenu.name}
+            trigger={channelMenuTriggerRef.current}
+            canEditProperties={channelForMenu.ownerEditable}
+            onProperties={() => openChannelProperties(channelForMenu)}
+            onMove={() => setMoveChannelTarget(channelForMenu)}
+            onClose={() => setOpenChannelMenuId(null)}
+          />
+        )}
+        {dmMenu && (
+          <div
+            ref={dmMenuRef}
+            className="context-menu"
+            role="menu"
+            aria-label="Действия с перепиской"
+            style={{ left: dmMenu.position.x, top: dmMenu.position.y }}
+            onKeyDown={(event) => {
+              if (event.key !== "Escape") return;
+              event.preventDefault();
+              closeDmMenuAndRestoreFocus(dmMenu.conversationId);
+            }}
+          >
+            <button
+              type="button"
+              role="menuitem"
+              className="context-menu-item"
+              onClick={() => void handleCloseConversation(dmMenu.conversationId)}
+            >
+              <span>Закрыть переписку</span>
+            </button>
+          </div>
+        )}
+        {moveChannelTarget && (
+          <MoveToCategoryMenu
+            open
+            channelName={moveChannelTarget.name}
+            currentCategoryId={moveChannelTarget.categoryId}
+            categories={categories}
+            onClose={closeMoveChannelDialog}
+            onMove={handleMoveChannel}
+          />
+        )}
+        <CreateChannelModal
+          open={createChannelTarget !== undefined}
+          category={createChannelTarget ?? null}
+          onClose={() => setCreateChannelTarget(undefined)}
+          onCreate={handleCreateChannel}
+          onSessionExpired={clearPrivateSession}
+        />
+        <CreateDmDialog
+          open={createDmOpen}
+          onClose={() => setCreateDmOpen(false)}
+          csrfToken={csrfToken}
+          onCreated={(conversation) => {
+            void refreshConversations();
+            selectConversation(conversation.id);
+          }}
+          onSessionExpired={clearPrivateSession}
+        />
+        {selectedConversation?.kind === "group" && (
+          <AddDmMembersDialog
+            open={addDmMembersOpen}
+            onClose={() => setAddDmMembersOpen(false)}
+            conversation={selectedConversation}
+            csrfToken={csrfToken}
+            onAdded={(announcement) => {
+              setDmMembersAnnouncement(announcement);
+              void refreshConversations();
+            }}
+            onSessionExpired={clearPrivateSession}
+          />
+        )}
+        {channelPropertiesTarget && (
+          <ChannelPropertiesModal
+            open
+            channelId={channelPropertiesTarget.id}
+            categories={categories}
+            csrfToken={csrfToken}
+            canManage={channelPropertiesTarget.ownerEditable}
+            onClose={() => setChannelPropertiesTarget(null)}
+            onSessionExpired={clearPrivateSession}
+            onSaved={() => {
+              void getChannels().then((data) => {
+                if (screen !== "authenticated") return;
+                channelsRef.current = data.channels;
+                setChannels(data.channels);
+                setCategories(data.categories);
+                replaceUnreadCounts(data.channels, true);
+              }).catch((refreshError: unknown) => {
+                if (refreshError instanceof ApiError && refreshError.status === 401) {
+                  clearPrivateSession();
+                  return;
+                }
+                setErrorMessage("Не удалось обновить данные канала. Обновите страницу и попробуйте снова.");
+              });
+            }}
+          />
+        )}
+        {categoryForMenu && (
+          <ChannelCategoryMenu
+            name={categoryForMenu.name}
+            trigger={categoryMenuTriggerRef.current}
+            expanded={!collapsedCategoryIds.has(categoryForMenu.id)}
+            canMoveUp={!isReorderingCategories && categories.findIndex((category) => category.id === categoryForMenu.id) > 0}
+            canMoveDown={!isReorderingCategories && categories.findIndex((category) => category.id === categoryForMenu.id) < categories.length - 1}
+            onToggle={() => toggleCategoryCollapsed(categoryForMenu.id)}
+            onRename={() => setRenameCategoryTarget(categoryForMenu)}
+            onDelete={() => {
+              setDeleteCategoryError(undefined);
+              setDeleteCategoryTarget(categoryForMenu);
+            }}
+            onMoveUp={() => void handleReorderCategory(categoryForMenu.id, -1)}
+            onMoveDown={() => void handleReorderCategory(categoryForMenu.id, 1)}
+            onClose={() => setOpenCategoryMenuId(null)}
+          />
+        )}
+        <CategoryDialog
+          open={renameCategoryTarget !== null}
+          onClose={closeRenameCategoryDialog}
+          mode="rename"
+          {...(renameCategoryTarget ? { initialName: renameCategoryTarget.name } : {})}
+          onSubmit={async (name) => {
+            const validationError = categoryNameValidationError(name);
+            if (validationError) throw new Error(validationError);
+            if (!csrfToken || !renameCategoryTarget) throw new Error("Не удалось подготовить защищённый запрос");
+            try {
+              const updated = await renameCategoryRequest(renameCategoryTarget.id, name, csrfToken);
+              setCategories((current) => current.map((entry) => entry.id === updated.id ? updated : entry));
+            } catch (error) {
+              throw new Error(requestError(error));
+            }
+          }}
+          onError={setErrorMessage}
+        />
+        <ConfirmDialog
+          open={deleteCategoryTarget !== null}
+          title={`Удалить категорию «${deleteCategoryTarget?.name ?? ""}»`}
+          description="Каналы этой категории перейдут в раздел «Без категории». Переписка не пропадёт."
+          confirmCheckboxLabel="Подтверждаю удаление категории и перенос её каналов в «Без категории»"
+          confirmLabel="Удалить"
+          onConfirm={confirmDeleteCategory}
+          onCancel={closeDeleteCategoryDialog}
+          busy={isDeletingCategory}
+          {...(deleteCategoryError ? { errorMessage: deleteCategoryError } : {})}
+        />
+        <div className="workspace-content" inert={openOverlay !== null}>
+          <div className="chat-pane">
+            <section className="settings-card workspace-message-panel" aria-labelledby="workspace-messages-title">
+              <header className="chat-pane-header">
+                {openConversation ? (
+                  <DmHeader conversation={openConversation} currentUserId={user.id} />
+                ) : (
+                  <>
+                <span className="channel-hash" aria-hidden="true">#</span>
+                <h2 id="workspace-messages-title">
+                  <button
+                    type="button"
+                    className="channel-name-trigger"
+                    aria-expanded={pinsOpen}
+                    aria-controls="channel-pins-panel"
+                    onClick={() => {
+                      if (!selectedChannel?.canView) return;
+                      setPinsOpen(true);
+                    }}
+                  >
+                    {selectedChannel?.name ?? "Выберите канал"}
+                  </button>
+                </h2>
+                {selectedChannel?.canView && selectedChannel.description && (
+                  <button
+                    type="button"
+                    className="channel-topic"
+                    aria-expanded={expandedChannelTopicId === selectedChannel.id}
+                    aria-controls={`channel-topic-expanded-${selectedChannel.id}`}
+                    onClick={() => setExpandedChannelTopicId((current) => current === selectedChannel.id ? null : selectedChannel.id)}
+                  >
+                    {selectedChannel.description}
+                  </button>
+                )}
+                {selectedChannel?.visibility === "known" && (
+                  <span className="channel-mode-badge">Известен всем, но закрыт</span>
+                )}
+                {selectedChannel?.ownerEditable && (
+                  <button
+                    type="button"
+                    className="icon-btn channel-properties-trigger"
+                    aria-label="Свойства канала"
+                    onClick={() => openChannelProperties(selectedChannel)}
+                  >
+                    <GearIcon />
+                  </button>
+                )}
+                  </>
+                )}
+              </header>
+              {selectedChannel?.canView && selectedChannel.description && (
+                <div
+                  id={`channel-topic-expanded-${selectedChannel.id}`}
+                  className="channel-topic-expanded"
+                  hidden={expandedChannelTopicId !== selectedChannel.id}
+                >
+                  {selectedChannel.description}
+                </div>
+              )}
+              {accessDeniedChannelId && (
+                <p className="channel-access-hint" role="status" aria-live="polite">Нет доступа к этому каналу</p>
+              )}
+              <span className="visually-hidden" aria-live="polite">{dmAnnouncement}</span>
+              <span className="visually-hidden" aria-live="polite">{dmMembersAnnouncement}</span>
+              {openConversation ? (
+                <>
+                  <div className="message-stage">
+                    {isConversationHidden && (
+                      <DmHiddenCard
+                        onBack={() => {
+                          setSelectedConversationId(null);
+                          setHiddenConversationId(null);
+                          setHiddenConversationSnapshot(null);
+                          setMessages([]);
+                        }}
+                      />
+                    )}
+                    <MessageFeed
+                      {...feedProps}
+                      channelId={openConversation.id}
+                      hasMoreHistory={hasMoreHistory}
+                      onLoadEarlier={(before) => loadConversationEarlier(openConversation.id, before)}
+                      messages={messages.filter((message) => message.conversationId === openConversation.id)}
+                      canManageMessages={false}
+                      onRetry={retryConversationMessage}
+                      onEdit={handleEditConversationMessage}
+                      onDelete={(messageId) => void handleDeleteConversationMessage(messageId)}
+                      canEdit={(message) => message.authorId === user.id}
+                      canDelete={(message) => message.authorId === user.id}
+                      onForward={(message) => {
+                        if (message.conversationId === null) return;
+                        setForwardTarget({ source: { kind: "conversation", id: message.conversationId }, message });
+                      }}
+                      showDelivery
+                      emptyState={{
+                        heading: "Это начало переписки — напишите первое",
+                        body: openConversation.kind === "direct"
+                          ? "Отправьте первое сообщение — его увидит собеседник."
+                          : "Отправьте первое сообщение — его увидят участники переписки."
+                      }}
+                    />
+                  </div>
+                  {!isConversationHidden && (
+                    <>
+                      <TypingIndicator label={selectedConversationId ? typingLabelFor(selectedConversationId) : null} />
+                      <MessageComposer
+                        {...composerProps}
+                        onInput={() => {
+                          if (selectedConversationId) emitTyping(selectedConversationId);
+                        }}
+                        onSubmit={(content, token) => handleComposerSubmit("conversation", content, token)}
+                        disabled={false}
+                      />
+                    </>
+                  )}
+                </>
+              ) : selectedChannel ? (
+                <>
+                  <div className="message-stage">
+                    <MessageFeed
+                      {...feedProps}
+                      channelId={selectedChannel.id}
+                      hasMoreHistory={hasMoreHistory && !isSelectedChannelRevoked}
+                      lastReadSeq={channelLastReadSeq ?? 0}
+                      isRevoked={isSelectedChannelRevoked}
+                      onLoadEarlier={loadEarlierMessages}
+                      messages={messages.filter((message) => message.channelId === selectedChannel.id)}
+                      canManageMessages={canManageMessages}
+                      onJumpToUnread={() => {
+                        const article = document.querySelector<HTMLElement>(
+                          '.message-feed [data-first-unread="true"]'
+                        );
+                        article?.scrollIntoView({ behavior: "auto", block: "start" });
+                        article?.focus({ preventScroll: true });
+                      }}
+                      onRetry={handleRetryMessage}
+                      onEdit={handleEditMessage}
+                      onDelete={(messageId) => void handleDeleteMessage(messageId)}
+                      canEdit={canEditMessage}
+                      canSeeReaders={(message) => message.authorId === user.id}
+                      onOpenReaders={(message) => {
+                        if (message.channelId === null) return;
+                        openReaders(message.channelId, message.id);
+                      }}
+                      canPin={canManageMessages}
+                      canUnpin={(message) => canManageMessages || message.authorId === user.id}
+                      isPinned={(messageId) => pinnedMessageIds.has(messageId)}
+                      onPin={(message) => void handlePinMessage(message)}
+                      onUnpin={(message) => void handleUnpinMessage(message.id)}
+                      onForward={(message) => {
+                        if (message.channelId === null) return;
+                        setForwardTarget({ source: { kind: "channel", id: message.channelId }, message });
+                      }}
+                      visibleChannelIds={visibleChannelIds}
+                      onJumpToMessage={jumpToForwardedMessage}
+                    />
+                    {selectedChannel.canView && (
+                      <PinnedMessagesPanel
+                        open={pinsOpen}
+                        onClose={() => setPinsOpen(false)}
+                        channelId={selectedChannel.id}
+                        canManageMessages={canManageMessages}
+                        currentUserId={user.id}
+                        pinnedMessageIds={pinnedMessageIds}
+                        onUnpin={handleUnpinMessage}
+                        onJumpToMessage={jumpToPinnedMessage}
+                        timeZone={timeZone}
+                        theme={theme}
+                        onSessionExpired={clearPrivateSession}
+                      />
+                    )}
+                    {isSelectedChannelRevoked && revokedChannel && (
+                      <RevokedAccessCard reason={revokedChannel.reason} onBack={leaveRevokedChannel} />
+                    )}
+                    <MessageReadersModal
+                      open={readersMessage !== null}
+                      onClose={() => setReadersMessage(null)}
+                      channelId={readersMessage?.channelId ?? ""}
+                      messageId={readersMessage?.messageId ?? ""}
+                      timeZone={timeZone}
+                      onSessionExpired={clearPrivateSession}
+                    />
+                  </div>
+                  {!isSelectedChannelRevoked && (
+                    <MessageComposer
+                      {...composerProps}
+                      onSubmit={(content, token) => handleComposerSubmit("channel", content, token)}
+                      disabled={!selectedChannel.canSend}
+                      {...(!selectedChannel.canSend ? { disabledReason: "канал только для чтения" } : {})}
+                    />
+                  )}
+                </>
+              ) : (
+                <p className="settings-copy channel-selection-hint">Выберите канал слева, чтобы открыть переписку.</p>
+              )}
+              {/* Диалог пересылки общий для обеих областей: источник может быть
+                  и каналом, и перепиской. */}
+              {forwardTarget && (
+                <ForwardMessageDialog
+                  open
+                  onClose={() => setForwardTarget(null)}
+                  source={forwardTarget.source}
+                  message={forwardTarget.message}
+                  channels={channels}
+                  categories={categories}
+                  conversations={conversations}
+                  currentUserId={user.id}
+                  onForward={handleForwardMessage}
+                  timeZone={timeZone}
+                />
+              )}
+              <span className="visually-hidden" aria-live="polite">{forwardAnnouncement}</span>
+            </section>
+          </div>
+        </div>
+        <div
+          ref={openOverlay === "members" ? setOverlayPanelElement : undefined}
+          className={`members-panel${openOverlay === "members" ? " drawer drawer-right is-open" : ""}`}
+          {...(openOverlay === "members"
+            ? {
+              role: "dialog",
+              "aria-modal": true,
+              "aria-label": openConversation ? "Участники переписки" : "Состав канала",
+              tabIndex: -1
+            }
+            : {})}
+        >
+          {openConversation ? (
+            <DmMembersPanel
+              conversation={selectedConversation}
+              currentUserId={user.id}
+              csrfToken={csrfToken}
+              onMembersChanged={() => void refreshConversations()}
+              onOpenAddMembers={() => setAddDmMembersOpen(true)}
+              onSessionExpired={clearPrivateSession}
+            />
+          ) : (
+            <ChannelMembersPanel channelId={selectedChannelId} theme={theme} />
+          )}
+        </div>
+        {openOverlay && <div className="overlay" aria-hidden="true" onClick={closeOverlay} />}
+      </div>
+      <SettingsModal
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+        section={settingsSection}
+        onSectionChange={(section) => {
+          setAccessDeniedChannelId(null);
+          setSettingsSection(section);
+        }}
+        csrfToken={csrfToken}
+        user={user}
+        organizationName={organization.name}
+        organizationLogoUrl={organization.logoUrl ?? null}
+        onOrganizationSaved={(name) => {
+          // Переименование не должно убирать логотип из шапки.
+          setOrganization((current) => current ? { ...current, name } : { name, logoUrl: null });
+        }}
+        onLogoChanged={() => {
+          void getOrganization().then(setOrganization).catch(() => undefined);
+        }}
+        onUserUpdated={setUser}
+        canManageRoles={canManageRoles}
+        canManageChannels={canManageChannels}
+        isAdministrator={isAdministrator}
+        onSessionExpired={clearPrivateSession}
+        onPasswordChanged={handlePasswordChanged}
+        theme={theme}
+        onThemeChange={setTheme}
+      />
+    </main>
   );
 }
