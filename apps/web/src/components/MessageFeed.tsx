@@ -1,14 +1,13 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { FormEvent, PointerEvent } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
+import type { FormEvent } from "react";
 import type { MessageView } from "../api.js";
 import { getMessages } from "../api.js";
-import { avatarColor, initials } from "../lib/avatar";
-import { roleColorForTheme, type Theme } from "../lib/roles";
-import { MessageMarkdown } from "../markdown/MessageMarkdown";
-import { CheckIcon } from "./icons";
+import type { Theme } from "../lib/roles";
+import { useMessageFeedScroll } from "../hooks/useMessageFeedScroll";
 import { DayDivider, JumpToLatestBar, NewMessagesDivider } from "./FeedDecorations";
 import { FeedEmptyState, FeedErrorState, FeedLoadingState } from "./MessageFeedStates";
 import { MessageContextMenu } from "./MessageContextMenu";
+import { MessageFeedRow, cancelMessageLongPress, type LongPressState } from "./MessageFeedRow";
 import { PendingMessageList, type PendingMessage } from "./PendingMessageList";
 
 export type { PendingMessage } from "./PendingMessageList";
@@ -24,13 +23,6 @@ interface MessageMenuState {
   position: { x: number; y: number };
   canEdit: boolean;
   canDelete: boolean;
-}
-
-interface LongPressState {
-  timer: number;
-  pointerId: number;
-  x: number;
-  y: number;
 }
 
 interface MessageFeedProps {
@@ -72,32 +64,6 @@ interface MessageFeedProps {
   onForward?: (message: MessageView) => void;
   visibleChannelIds?: Set<string>;
   onJumpToMessage?: (messageId: string, channelId?: string) => boolean;
-}
-
-function formatMessageDateTime(createdAt: string, timeZone: string): string {
-  const date = new Date(createdAt);
-  if (Number.isNaN(date.getTime())) return createdAt;
-  try {
-    return new Intl.DateTimeFormat("ru-RU", {
-      day: "2-digit",
-      month: "2-digit",
-      year: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      hourCycle: "h23",
-      timeZone
-    }).format(date);
-  } catch {
-    return new Intl.DateTimeFormat("ru-RU", {
-      day: "2-digit",
-      month: "2-digit",
-      year: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-      hourCycle: "h23",
-      timeZone: "UTC"
-    }).format(date);
-  }
 }
 
 function formatDayDivider(
@@ -177,7 +143,6 @@ export function MessageFeed({
   visibleChannelIds,
   onJumpToMessage
 }: MessageFeedProps) {
-  const [isLoadingEarlier, setIsLoadingEarlier] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editContent, setEditContent] = useState("");
   const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
@@ -186,141 +151,33 @@ export function MessageFeed({
     savingMessageId === null && editContent.trim().length > 0 && editLength <= 2000 && editContent !== message.content;
   const [contextMenu, setContextMenu] = useState<MessageMenuState | null>(null);
   const [copyAnnouncement, setCopyAnnouncement] = useState("");
-  const [paginationError, setPaginationError] = useState(false);
-  const [isAwayFromLatest, setIsAwayFromLatest] = useState(false);
-  const scrollContainer = useRef<HTMLDivElement>(null);
-  const topSentinel = useRef<HTMLDivElement>(null);
-  const currentChannelId = useRef(channelId);
-  const positionedChannelId = useRef<string | null>(null);
-  const wasAtLatestRef = useRef(false);
   const longPressRef = useRef<LongPressState | null>(null);
   const uniqueMessages = Array.from(new Map(messages.map((message) => [message.id, message])).values())
     .sort((left, right) => left.seq - right.seq);
-  const latestMessage = uniqueMessages.at(-1);
-  const pendingRenderKey = JSON.stringify(pending.map(({ clientRequestId, content, reason, state }) => ({
-    clientRequestId,
-    content,
-    reason,
-    state
-  })));
   // Без курсора прочтения «первым непрочитанным» не считается ничего: дефолт 0
   // пометил бы так самое первое сообщение любой переписки.
   const unreadFloor = lastReadSeq ?? Number.POSITIVE_INFINITY;
   const firstUnread = uniqueMessages.find((message) => message.seq > unreadFloor);
-  const firstMessageSeq = uniqueMessages[0]?.seq;
 
-  function motionBehavior(): ScrollBehavior {
-    return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
-  }
-
-  const updateLatestDistance = useCallback(() => {
-    const container = scrollContainer.current;
-    if (!container) return;
-    const distanceFromLatest = Math.max(0, container.scrollHeight - container.scrollTop - container.clientHeight);
-    const isAway = distanceFromLatest > 200;
-    wasAtLatestRef.current = distanceFromLatest <= 2;
-    setIsAwayFromLatest(isAway);
-  }, []);
-
-  function focusMessage(messageId: string, scrollToStart = false): void {
-    const article = Array.from(document.querySelectorAll<HTMLElement>("[data-message-id]"))
-      .find((element) => element.dataset.messageId === messageId);
-    if (scrollToStart) article?.scrollIntoView({ behavior: motionBehavior(), block: "start" });
-    article?.focus({ preventScroll: true });
-  }
-
-  function jumpToLatest(): void {
-    const container = scrollContainer.current;
-    if (!container) return;
-    container.scrollTo({ top: container.scrollHeight, behavior: motionBehavior() });
-    window.requestAnimationFrame(updateLatestDistance);
-  }
-
-  function cancelLongPress(pointerId?: number): void {
-    const press = longPressRef.current;
-    if (!press || (pointerId !== undefined && press.pointerId !== pointerId)) return;
-    window.clearTimeout(press.timer);
-    longPressRef.current = null;
-  }
+  const {
+    scrollContainer,
+    topSentinel,
+    focusMessage,
+    jumpToLatest,
+    loadEarlier,
+    isLoadingEarlier,
+    paginationError,
+    isAwayFromLatest
+  } = useMessageFeedScroll({ channelId, hasMoreHistory, historyLoadState, isRevoked, onLoadEarlier, messages: uniqueMessages, pending });
 
   useEffect(() => {
-    currentChannelId.current = channelId;
-    setIsLoadingEarlier(false);
-    setPaginationError(false);
-    setIsAwayFromLatest(false);
-    positionedChannelId.current = null;
     setEditingMessageId(null);
     setEditContent("");
     setContextMenu(null);
-    cancelLongPress();
+    cancelMessageLongPress(longPressRef);
   }, [channelId]);
 
-  useEffect(() => () => cancelLongPress(), []);
-
-  const loadEarlier = useCallback(async () => {
-    if (!hasMoreHistory || isLoadingEarlier || isRevoked) return;
-    const container = scrollContainer.current;
-    const previousHeight = container?.scrollHeight ?? 0;
-    const previousTop = container?.scrollTop ?? 0;
-    const channelAtStart = channelId;
-    const before = firstMessageSeq;
-
-    setPaginationError(false);
-    setIsLoadingEarlier(true);
-    try {
-      await onLoadEarlier(before);
-      await new Promise<void>((resolve) => window.requestAnimationFrame(() => {
-        window.requestAnimationFrame(() => resolve());
-      }));
-      if (container && currentChannelId.current === channelAtStart && !isRevoked) {
-        container.scrollTop = previousTop + (container.scrollHeight - previousHeight);
-      }
-    } catch {
-      if (currentChannelId.current === channelAtStart) setPaginationError(true);
-    } finally {
-      setIsLoadingEarlier(false);
-    }
-  }, [channelId, firstMessageSeq, hasMoreHistory, isLoadingEarlier, isRevoked, onLoadEarlier]);
-
-  useLayoutEffect(() => {
-    const container = scrollContainer.current;
-    if (!container || historyLoadState !== "ready" || (uniqueMessages.length === 0 && pending.length === 0)) return;
-    if (positionedChannelId.current !== channelId || wasAtLatestRef.current) {
-      container.scrollTop = container.scrollHeight;
-    }
-    positionedChannelId.current = channelId;
-    updateLatestDistance();
-  }, [
-    channelId,
-    historyLoadState,
-    latestMessage?.content,
-    latestMessage?.id,
-    latestMessage?.seq,
-    pendingRenderKey,
-    uniqueMessages.length,
-    updateLatestDistance
-  ]);
-
-  useEffect(() => {
-    const sentinel = topSentinel.current;
-    const container = scrollContainer.current;
-    if (!sentinel || !container || firstMessageSeq === undefined || !hasMoreHistory || isRevoked || paginationError) return;
-    const observer = new IntersectionObserver((entries) => {
-      if (positionedChannelId.current === channelId && entries.some((entry) => entry.isIntersecting)) {
-        void loadEarlier();
-      }
-    }, { root: container, rootMargin: "120px 0px 0px 0px", threshold: 0 });
-    observer.observe(sentinel);
-    return () => observer.disconnect();
-  }, [channelId, firstMessageSeq, hasMoreHistory, isRevoked, loadEarlier, paginationError]);
-
-  useEffect(() => {
-    const container = scrollContainer.current;
-    if (!container) return;
-    container.addEventListener("scroll", updateLatestDistance, { passive: true });
-    updateLatestDistance();
-    return () => container.removeEventListener("scroll", updateLatestDistance);
-  }, [channelId, updateLatestDistance]);
+  useEffect(() => () => cancelMessageLongPress(longPressRef), []);
 
   useEffect(() => {
     if (isRevoked) setContextMenu(null);
@@ -409,177 +266,41 @@ export function MessageFeed({
               const canEditMessage = !isRevoked && !message.deleted && isOwnMessage && canEdit(message);
               const canDeleteMessage = !isRevoked && !message.deleted &&
                 (canDelete ? canDelete(message) : (isOwnMessage || canManageMessages));
-              const roleColor = message.authorRoles.find((role) => role.color !== null)?.color ?? null;
-              // Ссылка на оригинал строится только если оригинал жив, он из
-              // канала и канал-источник виден участнику. У оригинала из
-              // переписки адреса нет — логин выводится текстом.
-              const forwardedFrom = message.forwardedFrom;
-              const forwardedChannelId = forwardedFrom?.channelId ?? null;
-              const canLinkToOriginal = forwardedFrom !== null &&
-                forwardedChannelId !== null &&
-                forwardedFrom.conversationId === null &&
-                forwardedFrom.originalDeleted === false &&
-                visibleChannelIds !== undefined &&
-                visibleChannelIds.has(forwardedChannelId);
+              const isFirstUnread = firstUnread?.id === message.id;
+              const edit = editingMessageId === message.id ? {
+                content: editContent,
+                length: editLength,
+                saving: savingMessageId === message.id,
+                canSave: canSaveEdit(message),
+                onChange: setEditContent,
+                onSave: (event: FormEvent<HTMLFormElement>) => void saveEdit(event, message),
+                onCancel: () => cancelEditing(message.id)
+              } : null;
 
               return (
                 <Fragment key={message.id}>
                   {showDayDivider && <DayDivider label={formatDayDivider(message.createdAt, dayKey, timeZone)} />}
-                  {firstUnread?.id === message.id && (
+                  {isFirstUnread && (
                     <NewMessagesDivider onJump={() => {
                       if (onJumpToUnread) onJumpToUnread();
                       else focusMessage(message.id, true);
                     }} />
                   )}
-                  <article
-                    className={`${grouped ? "message-row message-row-grouped" : "message-row"}${message.deleted ? " message-row-deleted" : ""}`}
-                    data-message-id={message.id}
-                    data-first-unread={firstUnread?.id === message.id || undefined}
-                    aria-label={grouped ? `${message.authorLogin}: ${formatMessageDateTime(message.createdAt, timeZone)}` : undefined}
-                    tabIndex={0}
-                    onKeyDown={(event) => {
-                      if (event.target !== event.currentTarget || isRevoked || editingMessageId === message.id) return;
-                      if (event.key !== "ContextMenu" && !(event.shiftKey && event.key === "F10")) return;
-                      event.preventDefault();
-                      const { left, top, height } = event.currentTarget.getBoundingClientRect();
-                      openContextMenu(message, { x: left + 16, y: top + Math.min(height, 32) }, canEditMessage, canDeleteMessage);
-                    }}
-                    onContextMenu={(event) => {
-                      event.preventDefault();
-                      cancelLongPress();
-                      if (isRevoked) return;
-                      if (editingMessageId === message.id) return;
-                      openContextMenu(message, { x: event.clientX, y: event.clientY }, canEditMessage, canDeleteMessage);
-                    }}
-                    onPointerDown={(event: PointerEvent<HTMLElement>) => {
-                      if (isRevoked || event.pointerType !== "touch" || editingMessageId === message.id) return;
-                      cancelLongPress();
-                      const x = event.clientX;
-                      const y = event.clientY;
-                      const timer = window.setTimeout(() => {
-                        if (longPressRef.current?.timer !== timer) return;
-                        longPressRef.current = null;
-                        openContextMenu(message, { x, y }, canEditMessage, canDeleteMessage);
-                      }, 500);
-                      longPressRef.current = {
-                        timer,
-                        pointerId: event.pointerId,
-                        x,
-                        y
-                      };
-                    }}
-                    onPointerMove={(event: PointerEvent<HTMLElement>) => {
-                      const press = longPressRef.current;
-                      if (!press || press.pointerId !== event.pointerId) return;
-                      if (Math.hypot(event.clientX - press.x, event.clientY - press.y) > 10) cancelLongPress(event.pointerId);
-                    }}
-                    onPointerUp={(event: PointerEvent<HTMLElement>) => cancelLongPress(event.pointerId)}
-                    onPointerCancel={(event: PointerEvent<HTMLElement>) => cancelLongPress(event.pointerId)}
-                  >
-                    {grouped ? (
-                      <span className="message-avatar-spacer" aria-hidden="true" />
-                    ) : (
-                      <div
-                        className="message-avatar"
-                        ref={(element) => element?.style.setProperty("background", avatarColor(message.authorLogin))}
-                        aria-hidden="true"
-                      >
-                        {initials(message.authorLogin)}
-                      </div>
-                    )}
-                    <div className="message-content">
-                      {editingMessageId !== message.id && (
-                        <header className="message-header">
-                          {!grouped && (
-                            <span
-                              className="message-author"
-                              ref={(element) => {
-                                if (!element) return;
-                                const color = roleColorForTheme(roleColor, theme);
-                                if (color) element.style.setProperty("--role-color", color);
-                                else element.style.removeProperty("--role-color");
-                              }}
-                            >
-                              {message.authorLogin}
-                            </span>
-                          )}
-                          <time
-                            className="message-time"
-                            dateTime={message.createdAt}
-                            title={formatMessageDateTime(message.createdAt, timeZone)}
-                          >
-                            {formatMessageTime(message.createdAt)}
-                          </time>
-                          {showDelivery && isOwnMessage && !message.deleted && (
-                            <span
-                              className="message-delivery"
-                              role="img"
-                              aria-label="Доставлено на сервер"
-                              title="Доставлено на сервер"
-                            >
-                              <CheckIcon size={16} />
-                            </span>
-                          )}
-                          {message.editedAt !== null && <span className="message-edited">изменено</span>}
-                        </header>
-                      )}
-                      {editingMessageId === message.id ? (
-                        <form className="message-edit-form" onSubmit={(event) => void saveEdit(event, message)}>
-                          <textarea
-                            aria-label="Изменить сообщение"
-                            autoFocus
-                            rows={3}
-                            value={editContent}
-                            onChange={(event) => setEditContent(event.currentTarget.value)}
-                            onKeyDown={(event) => {
-                              if (event.key === "Escape" && savingMessageId !== message.id) cancelEditing(message.id);
-                            }}
-                          />
-                          <div className="message-edit-footer">
-                            <span className={editLength > 2000 ? "message-counter message-error" : "message-counter"}>
-                              {editLength}/2000
-                            </span>
-                            <button
-                              type="submit"
-                              disabled={!canSaveEdit(message)}
-                              aria-busy={savingMessageId === message.id}
-                            >
-                              {savingMessageId === message.id ? "Сохраняем…" : "Сохранить"}
-                            </button>
-                            <button type="button" disabled={savingMessageId === message.id} onClick={() => cancelEditing(message.id)}>
-                              Отмена
-                            </button>
-                          </div>
-                        </form>
-                      ) : message.deleted ? (
-                        <p className="message-body message-deleted">Сообщение удалено</p>
-                      ) : forwardedFrom ? (
-                        <div className="forwarded-block">
-                          <p className="forwarded-label">
-                            {"Переслано от "}
-                            {canLinkToOriginal ? (
-                              <button
-                                type="button"
-                                className="forwarded-author"
-                                onClick={() => {
-                                  if (forwardedChannelId !== null) {
-                                    onJumpToMessage?.(forwardedFrom.messageId, forwardedChannelId);
-                                  }
-                                }}
-                              >
-                                {forwardedFrom.authorLogin}
-                              </button>
-                            ) : (
-                              <span className="forwarded-author">{forwardedFrom.authorLogin}</span>
-                            )}
-                          </p>
-                          <MessageMarkdown content={message.content} mentions={[]} />
-                        </div>
-                      ) : (
-                        <MessageMarkdown content={message.content} mentions={message.mentions.map((entry) => entry.login)} />
-                      )}
-                    </div>
-                  </article>
+                  <MessageFeedRow
+                    message={message}
+                    grouped={grouped}
+                    firstUnread={isFirstUnread}
+                    showDelivery={showDelivery && isOwnMessage && !message.deleted}
+                    theme={theme}
+                    timeZone={timeZone}
+                    formatMessageTime={formatMessageTime}
+                    edit={edit}
+                    isRevoked={isRevoked}
+                    longPressRef={longPressRef}
+                    visibleChannelIds={visibleChannelIds}
+                    onJumpToMessage={onJumpToMessage}
+                    onOpenMenu={(position) => openContextMenu(message, position, canEditMessage, canDeleteMessage)}
+                  />
                 </Fragment>
               );
             })}
