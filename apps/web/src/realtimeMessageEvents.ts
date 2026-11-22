@@ -1,12 +1,9 @@
 import type { Socket } from "socket.io-client";
 import { isConversation, isMessage, type Conversation, type MessageView } from "./api.js";
+import { isRecord } from "./api/http.js";
 import { CONVERSATION_REALTIME, MESSAGE_REALTIME } from "./realtime.js";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-type MessageDeletion = { scopeId: string; messageId: string; updatedSeq: number };
+export type MessageDeletion = { scopeId: string; messageId: string; updatedSeq: number };
 
 function messageDeletion(value: unknown, scopeField: "channelId" | "conversationId"): MessageDeletion | null {
   if (!isRecord(value)) return null;

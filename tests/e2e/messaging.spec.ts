@@ -249,6 +249,7 @@ test.describe("channel messaging and reconnection", () => {
     const reconnectMessage = `reconnect-delivery-${randomUUID()}`;
     let documentNavigations = 0;
     let historyFetches = 0;
+    let socketHandshakes = 0;
     const firstSendResponse = Promise.withResolvers<void>();
     try {
       await selectChannelAndSettleHistory(manager.page, channel);
@@ -261,7 +262,11 @@ test.describe("channel messaging and reconnection", () => {
       const queuedRequestIds: Array<string | null> = [];
       const sentRequestIds: string[] = [];
       manager.page.on("request", (request) => {
-        if (request.method() !== "POST" || new URL(request.url()).pathname !== `/api/channels/${channel.id}/messages`) return;
+        const url = new URL(request.url());
+        if (url.pathname === "/socket.io/" && url.searchParams.get("transport") === "polling" && !url.searchParams.has("sid")) {
+          socketHandshakes += 1;
+        }
+        if (request.method() !== "POST" || url.pathname !== `/api/channels/${channel.id}/messages`) return;
         const { clientRequestId } = request.postDataJSON() as { clientRequestId: string };
         sentRequestIds.push(clientRequestId);
       });
@@ -324,6 +329,8 @@ test.describe("channel messaging and reconnection", () => {
       });
       const navigationCount = documentNavigations;
       const historyFetchCount = historyFetches;
+      const handshakesAfterReconnect = socketHandshakes;
+      expect(handshakesAfterReconnect).toBeGreaterThan(0);
 
       const liveMessageData = await sendFromComposer(member.page, liveMessage);
       await expect(messageWithText(manager.page, liveMessage)).toHaveCount(1);
@@ -365,6 +372,7 @@ test.describe("channel messaging and reconnection", () => {
       await expect(jumpToLatest).toBeVisible();
       await jumpToLatest.click();
       await expect.poll(distanceFromLatest).toBeLessThanOrEqual(2);
+      expect(socketHandshakes).toBe(handshakesAfterReconnect);
 
       await manager.page.reload();
       await expect(manager.page.locator(".app-shell")).toBeVisible();
