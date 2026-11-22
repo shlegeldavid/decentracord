@@ -5,25 +5,18 @@ import { getMessages } from "../api.js";
 import { avatarColor, initials } from "../lib/avatar";
 import { roleColorForTheme, type Theme } from "../lib/roles";
 import { MessageMarkdown } from "../markdown/MessageMarkdown";
-import { ClockIcon, CheckIcon } from "./icons";
+import { CheckIcon } from "./icons";
 import { DayDivider, JumpToLatestBar, NewMessagesDivider } from "./FeedDecorations";
 import { FeedEmptyState, FeedErrorState, FeedLoadingState } from "./MessageFeedStates";
 import { MessageContextMenu } from "./MessageContextMenu";
+import { PendingMessageList, type PendingMessage } from "./PendingMessageList";
+
+export type { PendingMessage } from "./PendingMessageList";
 
 export function getEarlierMessagePage(channelId: string, before: number | undefined) {
   return before === undefined
     ? getMessages(channelId, { limit: 50 })
     : getMessages(channelId, { before, limit: 50 });
-}
-
-// Область ожидающего сообщения: `channel:<id>` или `conversation:<id>` — тот же
-// ключ, которым App.tsx различает курсоры и карты сообщений.
-export interface PendingMessage {
-  clientRequestId: string;
-  scopeKey: string;
-  content: string;
-  state: "sending" | "failed" | "queued" | "rejected";
-  reason?: string;
 }
 
 interface MessageMenuState {
@@ -188,6 +181,9 @@ export function MessageFeed({
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editContent, setEditContent] = useState("");
   const [savingMessageId, setSavingMessageId] = useState<string | null>(null);
+  const editLength = Array.from(editContent).length;
+  const canSaveEdit = (message: MessageView) =>
+    savingMessageId === null && editContent.trim().length > 0 && editLength <= 2000 && editContent !== message.content;
   const [contextMenu, setContextMenu] = useState<MessageMenuState | null>(null);
   const [copyAnnouncement, setCopyAnnouncement] = useState("");
   const [paginationError, setPaginationError] = useState(false);
@@ -344,15 +340,7 @@ export function MessageFeed({
 
   async function saveEdit(event: FormEvent<HTMLFormElement>, message: MessageView): Promise<void> {
     event.preventDefault();
-    const length = Array.from(editContent).length;
-    if (
-      savingMessageId !== null ||
-      editContent.trim().length === 0 ||
-      length > 2000 ||
-      editContent === message.content
-    ) {
-      return;
-    }
+    if (!canSaveEdit(message)) return;
 
     setSavingMessageId(message.id);
     try {
@@ -548,13 +536,12 @@ export function MessageFeed({
                             }}
                           />
                           <div className="message-edit-footer">
-                            <span className={Array.from(editContent).length > 2000 ? "message-counter message-error" : "message-counter"}>
-                              {Array.from(editContent).length}/2000
+                            <span className={editLength > 2000 ? "message-counter message-error" : "message-counter"}>
+                              {editLength}/2000
                             </span>
                             <button
                               type="submit"
-                              disabled={savingMessageId !== null || editContent.trim().length === 0 ||
-                                Array.from(editContent).length > 2000 || editContent === message.content}
+                              disabled={!canSaveEdit(message)}
                               aria-busy={savingMessageId === message.id}
                             >
                               {savingMessageId === message.id ? "Сохраняем…" : "Сохранить"}
@@ -596,40 +583,7 @@ export function MessageFeed({
                 </Fragment>
               );
             })}
-            {pending.length > 0 && (
-              <div className="message-pending-list" aria-live="polite">
-                {pending.map((message) => (
-                  <article
-                    className={`message-row message-pending ${message.state}`}
-                    data-client-request-id={message.clientRequestId}
-                    key={message.clientRequestId}
-                  >
-                    <span className="message-avatar-spacer" aria-hidden="true" />
-                    <div className="message-content">
-                      <header className="message-header">
-                        <span className="message-author">Вы</span>
-                      </header>
-                      <MessageMarkdown content={message.content} mentions={[]} />
-                      <div className="message-meta">
-                        {message.state === "sending" && (
-                          <span className="message-clock" aria-label="Отправляется"><ClockIcon size={16} /></span>
-                        )}
-                        {message.state === "failed" && <span className="message-error">Не отправлено</span>}
-                        {message.state === "queued" && <span className="message-queued">В очереди</span>}
-                        {message.state === "rejected" && (
-                          <span className="message-error">Отправка отклонена: {message.reason || "Отправка отклонена."}</span>
-                        )}
-                        {message.state === "failed" && (
-                          <button type="button" className="message-action" onClick={() => onRetry(message.clientRequestId)}>
-                            Повторить
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            )}
+            <PendingMessageList messages={pending} onRetry={onRetry} />
           </>
         )}
       </div>
