@@ -3,10 +3,7 @@ import type { FormEvent } from "react";
 import {
   ApiError,
   closeConversation,
-  createChannel,
-  createCategory,
   createConversation,
-  deleteCategory as deleteCategoryRequest,
   deleteConversationMessage,
   deleteMessage,
   editConversationMessage,
@@ -24,14 +21,10 @@ import {
   isChannelCategory,
   listConversations,
   markConversationRead,
-  moveChannelToCategory as moveChannelToCategoryRequest,
   logout,
   login,
   markChannelRead,
   pinMessage,
-  reorderCategories as reorderCategoriesRequest,
-  reorderChannels as reorderChannelsRequest,
-  renameCategory as renameCategoryRequest,
   sendConversationMessage,
   sendMessage,
   unpinMessage,
@@ -39,7 +32,6 @@ import {
   type Channel,
   type ChannelCategory,
   type Conversation,
-  type CreateChannelInput,
   type MessageView,
   type Organization
 } from "./api";
@@ -48,13 +40,9 @@ import { ForwardMessageDialog } from "./components/ForwardMessageDialog";
 import { MessageFeed, getEarlierMessagePage, type PendingMessage } from "./components/MessageFeed";
 import { MessageReadersModal } from "./components/MessageReadersModal";
 import { PinnedMessagesPanel } from "./components/PinnedMessagesPanel";
-import { ChannelMenu } from "./components/ChannelMenu";
-import { ChannelPropertiesModal } from "./components/ChannelPropertiesModal";
-import { MoveToCategoryMenu } from "./components/MoveToCategoryMenu";
 import { RevokedAccessCard } from "./components/RevokedAccessCard";
 import { ChannelMembersPanel } from "./components/ChannelMembersPanel";
-import { ChannelSidebar } from "./components/ChannelSidebar";
-import { CreateChannelModal } from "./components/CreateChannelModal";
+import { WorkspaceChannelSidebar } from "./components/WorkspaceChannelSidebar";
 import { CreateDmDialog } from "./components/CreateDmDialog";
 import { AddDmMembersDialog } from "./components/AddDmMembersDialog";
 import { DmHeader } from "./components/DmHeader";
@@ -62,19 +50,13 @@ import { DmHiddenCard } from "./components/DmHiddenCard";
 import { DmMembersPanel } from "./components/DmMembersPanel";
 import { DmSection } from "./components/DmSection";
 import { TypingIndicator } from "./components/TypingIndicator";
-import { ChannelCategoryMenu } from "./components/ChannelCategoryMenu";
-import { CategoryDialog } from "./components/CategoryDialog";
-import { ConfirmDialog } from "./components/ui/ConfirmDialog";
-import { requestError } from "./components/settings/ChannelOverrideEditor";
 import { AppHeader } from "./components/AppHeader";
 import { PeopleSearch } from "./components/PeopleSearch";
 import { GearIcon } from "./components/icons";
 import { LoginScreen } from "./components/LoginScreen";
 import { SettingsModal, type SettingsSection } from "./components/SettingsModal";
-import type { ReorderDropTarget, ReorderItem } from "./components/useDragReorder";
 import { useTheme } from "./hooks/useTheme";
 import { useTimezone } from "./hooks/useTimezone";
-import { reorderChannel, swapCategories } from "./lib/channelOrder";
 import { CHANNEL_REALTIME, CONVERSATION_REALTIME, connectRealtime, type RealtimeStatus } from "./realtime";
 import { bindChannelMessageEvents, bindConversationMessageEvents } from "./realtimeMessageEvents";
 
@@ -166,13 +148,6 @@ function rejectedSendReason(error: unknown): string {
   return error.message || "Отправка отклонена.";
 }
 
-function categoryNameValidationError(value: string): string | null {
-  const length = Array.from(value.trim()).length;
-  return length < 1 || length > 80
-    ? "Название категории должно содержать от 1 до 80 символов."
-    : null;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -233,34 +208,6 @@ function createClientRequestId(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-function placeChannelAtCategoryEnd(
-  channels: Channel[],
-  categories: ChannelCategory[],
-  movedChannel: Channel
-): Channel[] {
-  const remaining = channels.filter((channel) => channel.id !== movedChannel.id);
-  const sameCategory = remaining.filter((channel) => channel.categoryId === movedChannel.categoryId);
-  let insertionIndex = 0;
-
-  if (sameCategory.length > 0) {
-    insertionIndex = remaining.indexOf(sameCategory[sameCategory.length - 1]!) + 1;
-  } else if (movedChannel.categoryId !== null) {
-    const categoryIndex = categories.findIndex((category) => category.id === movedChannel.categoryId);
-    const followingCategory = categories.slice(categoryIndex + 1).find((category) =>
-      remaining.some((channel) => channel.categoryId === category.id)
-    );
-    insertionIndex = followingCategory
-      ? remaining.findIndex((channel) => channel.categoryId === followingCategory.id)
-      : remaining.length;
-  }
-
-  return [
-    ...remaining.slice(0, insertionIndex),
-    movedChannel,
-    ...remaining.slice(insertionIndex)
-  ];
-}
-
 export function App() {
   const [screen, setScreen] = useState<ScreenState>("loading");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -270,18 +217,8 @@ export function App() {
   const [organization, setOrganization] = useState<Organization | null>(null);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [categories, setCategories] = useState<ChannelCategory[]>([]);
-  const [dragAnnouncement, setDragAnnouncement] = useState("");
-  const [createChannelTarget, setCreateChannelTarget] = useState<ChannelCategory | null | undefined>(undefined);
-  const [openCategoryMenuId, setOpenCategoryMenuId] = useState<string | null>(null);
-  const [isReorderingCategories, setIsReorderingCategories] = useState(false);
-  const [openChannelMenuId, setOpenChannelMenuId] = useState<string | null>(null);
   const [dmMenu, setDmMenu] = useState<OpenDmMenu | null>(null);
   const [channelPropertiesTarget, setChannelPropertiesTarget] = useState<Channel | null>(null);
-  const [moveChannelTarget, setMoveChannelTarget] = useState<Channel | null>(null);
-  const [renameCategoryTarget, setRenameCategoryTarget] = useState<ChannelCategory | null>(null);
-  const [deleteCategoryTarget, setDeleteCategoryTarget] = useState<ChannelCategory | null>(null);
-  const [deleteCategoryError, setDeleteCategoryError] = useState<string | undefined>(undefined);
-  const [isDeletingCategory, setIsDeletingCategory] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(readInitialSidebarWidth);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readInitialSidebarCollapsed);
   const [collapsedCategoryIds, setCollapsedCategoryIds] = useState<Set<string>>(() => new Set());
@@ -332,8 +269,6 @@ export function App() {
   const { theme, setTheme, toggleTheme } = useTheme(user, csrfToken);
   const { timeZone, dayKey, formatMessageTime } = useTimezone(user);
   const appShellElementRef = useRef<HTMLElement | null>(null);
-  const categoryMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const channelMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
   const dmMenuRef = useRef<HTMLDivElement | null>(null);
   const overlayPanelRef = useRef<HTMLElement | null>(null);
   const overlayReturnFocusRef = useRef<HTMLElement | null>(null);
@@ -344,7 +279,6 @@ export function App() {
   const loginInput = useRef<HTMLInputElement>(null);
   const realtimeSocket = useRef<ReturnType<typeof connectRealtime> | null>(null);
   const channelsRef = useRef<Channel[]>([]);
-  const orderSaveInFlightRef = useRef(false);
   const selectedChannelIdRef = useRef<string | null>(null);
   const selectedConversationIdRef = useRef<string | null>(null);
   const conversationsRef = useRef<Conversation[]>([]);
@@ -388,12 +322,6 @@ export function App() {
   // Переписка скрыта: строки в списке уже нет, но лента и история остаются.
   const isConversationHidden = hiddenConversationId !== null && selectedConversationId === hiddenConversationId;
   const openConversation = selectedConversation ?? (isConversationHidden ? hiddenConversationSnapshot : null);
-  const categoryForMenu = openCategoryMenuId
-    ? categories.find((category) => category.id === openCategoryMenuId) ?? null
-    : null;
-  const channelForMenu = openChannelMenuId
-    ? channels.find((channel) => channel.id === openChannelMenuId) ?? null
-    : null;
   const isSelectedChannelRevoked = revokedChannel?.id === selectedChannelId;
   const canManageMessages = selectedChannel?.canManageMessages === true;
 
@@ -653,12 +581,6 @@ export function App() {
     setOrganization(null);
     setChannels([]);
     setCategories([]);
-    setOpenCategoryMenuId(null);
-    setRenameCategoryTarget(null);
-    setDeleteCategoryTarget(null);
-    setDeleteCategoryError(undefined);
-    setIsDeletingCategory(false);
-    categoryMenuTriggerRef.current = null;
     channelsRef.current = [];
     setSelectedChannelId(null);
     setAccessDeniedChannelId(null);
@@ -711,10 +633,7 @@ export function App() {
     setSettingsOpen(false);
     setSettingsSection("account");
     setOpenOverlay(null);
-    setOpenCategoryMenuId(null);
-    setOpenChannelMenuId(null);
     setChannelPropertiesTarget(null);
-    setMoveChannelTarget(null);
     setPassword("");
     setErrorMessage(null);
     setSuccessMessage(null);
@@ -1841,117 +1760,6 @@ export function App() {
     }
   }
 
-  function handleOpenCategoryMenu(categoryId: string, trigger: HTMLButtonElement): void {
-    if (!canManageChannels) return;
-    const category = categories.find((entry) => entry.id === categoryId);
-    if (!category) return;
-    categoryMenuTriggerRef.current = trigger;
-    setOpenChannelMenuId(null);
-    setOpenCategoryMenuId((current) => current === categoryId ? null : categoryId);
-  }
-
-  function handleOpenCreateChannel(categoryId: string | null): void {
-    if (!canManageChannels) return;
-    if (categoryId === null) {
-      setCreateChannelTarget(null);
-      return;
-    }
-    const category = categories.find((entry) => entry.id === categoryId);
-    if (category) setCreateChannelTarget(category);
-  }
-
-  async function handleCreateChannel(input: CreateChannelInput): Promise<void> {
-    if (!csrfToken) throw new Error("Не удалось подготовить защищённый запрос");
-    await createChannel(input, csrfToken);
-    const channelData = await getChannels();
-    channelsRef.current = channelData.channels;
-    setChannels(channelData.channels);
-    setCategories(channelData.categories);
-    replaceUnreadCounts(channelData.channels, true);
-  }
-
-  async function saveCategoryOrder(next: ChannelCategory[], token: string, announcement?: string): Promise<void> {
-    orderSaveInFlightRef.current = true;
-    setCategories(next);
-    setIsReorderingCategories(true);
-    try {
-      await reorderCategoriesRequest(next.map((category) => category.id), token);
-      if (announcement) setDragAnnouncement(announcement);
-    } catch {
-      setCategories(categories);
-      setErrorMessage("Не удалось сохранить порядок. Попробуйте ещё раз.");
-    } finally {
-      orderSaveInFlightRef.current = false;
-      setIsReorderingCategories(false);
-    }
-  }
-
-  async function handleReorderCategory(categoryId: string, direction: -1 | 1): Promise<void> {
-    if (isReorderingCategories || orderSaveInFlightRef.current) return;
-    const index = categories.findIndex((category) => category.id === categoryId);
-    const next = swapCategories(categories, index, index + direction);
-    if (!next) return;
-    if (!csrfToken) {
-      setErrorMessage("Не удалось сохранить порядок. Попробуйте ещё раз.");
-      return;
-    }
-
-    setErrorMessage(null);
-    await saveCategoryOrder(next, csrfToken);
-  }
-
-  async function handleReorderItem(item: ReorderItem, target: ReorderDropTarget): Promise<void> {
-    if (!canManageChannels || orderSaveInFlightRef.current) return;
-    if (!csrfToken) {
-      setErrorMessage("Не удалось сохранить порядок. Попробуйте ещё раз.");
-      return;
-    }
-
-    setDragAnnouncement("");
-    setErrorMessage(null);
-
-    if (item.kind === "category") {
-      const sourceIndex = categories.findIndex((category) => category.id === item.id);
-      const targetIndex = target.type === "category"
-        ? categories.findIndex((category) => category.id === target.categoryId)
-        : -1;
-      const next = swapCategories(categories, sourceIndex, targetIndex);
-      if (next) {
-        const announcement = `Категория «${next[targetIndex]!.name}» перемещена на позицию ${targetIndex + 1}.`;
-        await saveCategoryOrder(next, csrfToken, announcement);
-      }
-      return;
-    }
-
-    const previous = channelsRef.current;
-    const next = reorderChannel(previous, categories, item.id, target);
-    if (!next) return;
-
-    orderSaveInFlightRef.current = true;
-    channelsRef.current = next.channels;
-    setChannels(next.channels);
-    try {
-      await reorderChannelsRequest(next.groups, csrfToken);
-      const targetCategoryName = categories.find((category) => category.id === target.categoryId)?.name ?? "Без категории";
-      setDragAnnouncement(`Канал «${next.movedChannel.name}» перемещён в категорию «${targetCategoryName}».`);
-    } catch {
-      channelsRef.current = previous;
-      setChannels(previous);
-      setErrorMessage("Не удалось сохранить порядок. Попробуйте ещё раз.");
-    } finally {
-      orderSaveInFlightRef.current = false;
-    }
-  }
-
-  function handleOpenChannelMenu(channelId: string, trigger: HTMLButtonElement): void {
-    if (!canManageChannels) return;
-    const channel = channels.find((entry) => entry.id === channelId);
-    if (!channel) return;
-    channelMenuTriggerRef.current = trigger;
-    setOpenCategoryMenuId(null);
-    setOpenChannelMenuId((current) => current === channelId ? null : channelId);
-  }
-
   // Меню строки диалога: единственный пункт «Закрыть переписку».
   function handleOpenDmMenu(conversationId: string, position: { x: number; y: number }): void {
     setDmMenu({
@@ -2013,71 +1821,6 @@ export function App() {
         ?? document.querySelector<HTMLElement>(".dm-section-add");
       target?.focus();
     });
-  }
-
-  function openChannelProperties(channel: Channel): void {
-    if (!channel.ownerEditable) return;
-    setOpenChannelMenuId(null);
-    setChannelPropertiesTarget(channel);
-  }
-
-  function closeMoveChannelDialog(): void {
-    setMoveChannelTarget(null);
-    window.requestAnimationFrame(() => channelMenuTriggerRef.current?.focus());
-  }
-
-  async function handleMoveChannel(categoryId: string | null): Promise<void> {
-    const target = moveChannelTarget;
-    if (!target || !csrfToken) throw new Error("CSRF token unavailable");
-    const moved = await moveChannelToCategoryRequest(target.id, categoryId, csrfToken);
-    const nextChannels = placeChannelAtCategoryEnd(channelsRef.current, categories, moved);
-    channelsRef.current = nextChannels;
-    setChannels(nextChannels);
-
-    void getChannels().then((channelData) => {
-      if (screen !== "authenticated") return;
-      channelsRef.current = channelData.channels;
-      setChannels(channelData.channels);
-      setCategories(channelData.categories);
-    }).catch((error: unknown) => {
-      if (error instanceof ApiError && error.status === 401) clearPrivateSession();
-    });
-  }
-
-  function closeRenameCategoryDialog(): void {
-    setRenameCategoryTarget(null);
-    const trigger = categoryMenuTriggerRef.current;
-    window.requestAnimationFrame(() => trigger?.focus());
-  }
-
-  function closeDeleteCategoryDialog(): void {
-    setDeleteCategoryTarget(null);
-    setDeleteCategoryError(undefined);
-    const trigger = categoryMenuTriggerRef.current;
-    window.requestAnimationFrame(() => trigger?.focus());
-  }
-
-  async function confirmDeleteCategory(): Promise<void> {
-    const category = deleteCategoryTarget;
-    if (!category) return;
-    setDeleteCategoryError(undefined);
-    setIsDeletingCategory(true);
-    try {
-      if (!csrfToken) throw new Error("CSRF token unavailable");
-      await deleteCategoryRequest(category.id, csrfToken);
-      const nextChannels = channelsRef.current.map((channel) =>
-        channel.categoryId === category.id ? { ...channel, categoryId: null } : channel
-      );
-      channelsRef.current = nextChannels;
-      setChannels(nextChannels);
-      setCategories((current) => current.filter((entry) => entry.id !== category.id));
-      setDeleteCategoryTarget(null);
-      categoryMenuTriggerRef.current = null;
-    } catch {
-      setDeleteCategoryError("Не удалось удалить категорию. Попробуйте ещё раз.");
-    } finally {
-      setIsDeletingCategory(false);
-    }
   }
 
   async function handleLogout(): Promise<void> {
@@ -2183,7 +1926,19 @@ export function App() {
       {errorMessage && <p className="form-error workspace-alert" role="alert">{errorMessage}</p>}
 
       <div className="workspace-grid">
-        <ChannelSidebar
+        <WorkspaceChannelSidebar
+          key={user.id}
+          csrfToken={csrfToken}
+          channelsRef={channelsRef}
+          replaceChannels={(items) => {
+            channelsRef.current = items;
+            setChannels(items);
+          }}
+          setCategories={setCategories}
+          preserveUnreadCounts={(items) => replaceUnreadCounts(items, true)}
+          onSessionExpired={clearPrivateSession}
+          propertiesTarget={channelPropertiesTarget}
+          onPropertiesTargetChange={setChannelPropertiesTarget}
           channels={channels}
           categories={categories}
           dmSection={(
@@ -2205,26 +1960,7 @@ export function App() {
             />
           )}
           canManageChannels={canManageChannels}
-          onCreateChannel={handleOpenCreateChannel}
-          onCreateCategory={async (name) => {
-            const validationError = categoryNameValidationError(name);
-            if (validationError) throw new Error(validationError);
-            if (!csrfToken) throw new Error("Не удалось подготовить защищённый запрос");
-            try {
-              await createCategory(name, csrfToken);
-              const channelData = await getChannels();
-              setCategories(channelData.categories);
-            } catch (error) {
-              throw new Error(requestError(error));
-            }
-          }}
           onCategoryError={setErrorMessage}
-          onReorderItem={(item, target) => void handleReorderItem(item, target)}
-          dragAnnouncement={dragAnnouncement}
-          onOpenCategoryMenu={handleOpenCategoryMenu}
-          openCategoryMenuId={openCategoryMenuId}
-          onOpenChannelMenu={handleOpenChannelMenu}
-          openChannelMenuId={openChannelMenuId}
           selectedChannelId={selectedChannelId}
           unreadCounts={unreadCounts}
           collapsedCategoryIds={collapsedCategoryIds}
@@ -2248,16 +1984,6 @@ export function App() {
           onCloseOverlay={closeOverlay}
           {...(openOverlay === "channels" ? { dialogRef: setOverlayPanelElement } : {})}
         />
-        {channelForMenu && (
-          <ChannelMenu
-            name={channelForMenu.name}
-            trigger={channelMenuTriggerRef.current}
-            canEditProperties={channelForMenu.ownerEditable}
-            onProperties={() => openChannelProperties(channelForMenu)}
-            onMove={() => setMoveChannelTarget(channelForMenu)}
-            onClose={() => setOpenChannelMenuId(null)}
-          />
-        )}
         {dmMenu && (
           <div
             ref={dmMenuRef}
@@ -2281,23 +2007,6 @@ export function App() {
             </button>
           </div>
         )}
-        {moveChannelTarget && (
-          <MoveToCategoryMenu
-            open
-            channelName={moveChannelTarget.name}
-            currentCategoryId={moveChannelTarget.categoryId}
-            categories={categories}
-            onClose={closeMoveChannelDialog}
-            onMove={handleMoveChannel}
-          />
-        )}
-        <CreateChannelModal
-          open={createChannelTarget !== undefined}
-          category={createChannelTarget ?? null}
-          onClose={() => setCreateChannelTarget(undefined)}
-          onCreate={handleCreateChannel}
-          onSessionExpired={clearPrivateSession}
-        />
         <CreateDmDialog
           open={createDmOpen}
           onClose={() => setCreateDmOpen(false)}
@@ -2321,79 +2030,6 @@ export function App() {
             onSessionExpired={clearPrivateSession}
           />
         )}
-        {channelPropertiesTarget && (
-          <ChannelPropertiesModal
-            open
-            channelId={channelPropertiesTarget.id}
-            categories={categories}
-            csrfToken={csrfToken}
-            canManage={channelPropertiesTarget.ownerEditable}
-            onClose={() => setChannelPropertiesTarget(null)}
-            onSessionExpired={clearPrivateSession}
-            onSaved={() => {
-              void getChannels().then((data) => {
-                if (screen !== "authenticated") return;
-                channelsRef.current = data.channels;
-                setChannels(data.channels);
-                setCategories(data.categories);
-                replaceUnreadCounts(data.channels, true);
-              }).catch((refreshError: unknown) => {
-                if (refreshError instanceof ApiError && refreshError.status === 401) {
-                  clearPrivateSession();
-                  return;
-                }
-                setErrorMessage("Не удалось обновить данные канала. Обновите страницу и попробуйте снова.");
-              });
-            }}
-          />
-        )}
-        {categoryForMenu && (
-          <ChannelCategoryMenu
-            name={categoryForMenu.name}
-            trigger={categoryMenuTriggerRef.current}
-            expanded={!collapsedCategoryIds.has(categoryForMenu.id)}
-            canMoveUp={!isReorderingCategories && categories.findIndex((category) => category.id === categoryForMenu.id) > 0}
-            canMoveDown={!isReorderingCategories && categories.findIndex((category) => category.id === categoryForMenu.id) < categories.length - 1}
-            onToggle={() => toggleCategoryCollapsed(categoryForMenu.id)}
-            onRename={() => setRenameCategoryTarget(categoryForMenu)}
-            onDelete={() => {
-              setDeleteCategoryError(undefined);
-              setDeleteCategoryTarget(categoryForMenu);
-            }}
-            onMoveUp={() => void handleReorderCategory(categoryForMenu.id, -1)}
-            onMoveDown={() => void handleReorderCategory(categoryForMenu.id, 1)}
-            onClose={() => setOpenCategoryMenuId(null)}
-          />
-        )}
-        <CategoryDialog
-          open={renameCategoryTarget !== null}
-          onClose={closeRenameCategoryDialog}
-          mode="rename"
-          {...(renameCategoryTarget ? { initialName: renameCategoryTarget.name } : {})}
-          onSubmit={async (name) => {
-            const validationError = categoryNameValidationError(name);
-            if (validationError) throw new Error(validationError);
-            if (!csrfToken || !renameCategoryTarget) throw new Error("Не удалось подготовить защищённый запрос");
-            try {
-              const updated = await renameCategoryRequest(renameCategoryTarget.id, name, csrfToken);
-              setCategories((current) => current.map((entry) => entry.id === updated.id ? updated : entry));
-            } catch (error) {
-              throw new Error(requestError(error));
-            }
-          }}
-          onError={setErrorMessage}
-        />
-        <ConfirmDialog
-          open={deleteCategoryTarget !== null}
-          title={`Удалить категорию «${deleteCategoryTarget?.name ?? ""}»`}
-          description="Каналы этой категории перейдут в раздел «Без категории». Переписка не пропадёт."
-          confirmCheckboxLabel="Подтверждаю удаление категории и перенос её каналов в «Без категории»"
-          confirmLabel="Удалить"
-          onConfirm={confirmDeleteCategory}
-          onCancel={closeDeleteCategoryDialog}
-          busy={isDeletingCategory}
-          {...(deleteCategoryError ? { errorMessage: deleteCategoryError } : {})}
-        />
         <div className="workspace-content" inert={openOverlay !== null}>
           <div className="chat-pane">
             <section className="settings-card workspace-message-panel" aria-labelledby="workspace-messages-title">
@@ -2436,7 +2072,7 @@ export function App() {
                     type="button"
                     className="icon-btn channel-properties-trigger"
                     aria-label="Свойства канала"
-                    onClick={() => openChannelProperties(selectedChannel)}
+                    onClick={() => setChannelPropertiesTarget(selectedChannel)}
                   >
                     <GearIcon />
                   </button>
