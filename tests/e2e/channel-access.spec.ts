@@ -457,7 +457,8 @@ test.describe("channel visibility and delegated access", () => {
     await login(page, identity.admin);
     const adminContext = page.context();
     const adminCsrf = await issueCsrf(adminContext);
-    const viewerRole = await createRole(adminContext, adminCsrf, `e2e-live-viewer-${suffix}`, ["VIEW_CHANNEL"]);
+    const permissions = ["VIEW_CHANNEL", "SEND_MESSAGES"];
+    const viewerRole = await createRole(adminContext, adminCsrf, `e2e-live-viewer-${suffix}`, permissions);
     const channelName = `e2e-live-channel-${suffix}`;
     const channel = await createChannel(adminContext, adminCsrf, channelName);
     const member = await createMember(adminContext, adminCsrf, memberCredentials.login, memberCredentials.password);
@@ -549,7 +550,7 @@ test.describe("channel visibility and delegated access", () => {
 
       const permissionGrantSync = waitForSocketEvent(socket, "channels:sync");
       const restorePermission = await adminContext.request.patch(`${applicationOrigin}/api/roles/${viewerRole.id}`, {
-        data: { permissions: ["VIEW_CHANNEL"] },
+        data: { permissions },
         headers: writeHeaders(adminCsrf),
         failOnStatusCode: false
       });
@@ -598,6 +599,43 @@ test.describe("channel visibility and delegated access", () => {
         event: "channel:subscribed",
         payload: { channelId: channel.id }
       });
+      await memberChannel.locator(".channel-list-select").click();
+      const offlineMessage = "Сообщение из очереди закрытого канала";
+      const replayedIds: string[] = [];
+      memberSession.page.on("request", (request) => {
+        if (request.method() === "POST" && new URL(request.url()).pathname === historyPath) {
+          const { clientRequestId } = request.postDataJSON() as { clientRequestId: string };
+          replayedIds.push(clientRequestId);
+        }
+      });
+      await memberSession.context.setOffline(true);
+      await expect(memberSession.page.locator(".connection-status")).toContainText("нет связи", { timeout: 15_000 });
+      await memberSession.page.getByLabel("Сообщение").fill(offlineMessage);
+      await memberSession.page.getByRole("button", { name: "Отправить", exact: true }).click();
+      await expect(memberSession.page.locator(".message-pending.queued").filter({ hasText: offlineMessage })).toBeVisible();
+
+      const revokeWhileOffline = await adminContext.request.patch(`${applicationOrigin}/api/roles/${viewerRole.id}`, {
+        data: { permissions: [] },
+        headers: writeHeaders(adminCsrf),
+        failOnStatusCode: false
+      });
+      expect(revokeWhileOffline.status(), await revokeWhileOffline.text()).toBe(200);
+      await memberSession.context.setOffline(false);
+      await expect(memberSession.page.locator(".connection-status")).toContainText("подключено", { timeout: 15_000 });
+      await expect(revoked).toBeVisible();
+      await expect(memberSession.page.getByText(offlineMessage, { exact: true })).toHaveCount(0);
+      expect(replayedIds).toEqual([]);
+
+      const restoreAfterReconnect = await adminContext.request.patch(`${applicationOrigin}/api/roles/${viewerRole.id}`, {
+        data: { permissions },
+        headers: writeHeaders(adminCsrf),
+        failOnStatusCode: false
+      });
+      expect(restoreAfterReconnect.status(), await restoreAfterReconnect.text()).toBe(200);
+      await expect(memberChannel).toBeVisible();
+      await memberChannel.locator(".channel-list-select").click();
+      await expect(memberSession.page.getByText(offlineMessage, { exact: true })).toHaveCount(0);
+      expect(replayedIds).toEqual([]);
     } finally {
       heldHistory.resolve();
       socket?.disconnect();

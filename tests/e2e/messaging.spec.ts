@@ -249,6 +249,7 @@ test.describe("channel messaging and reconnection", () => {
     const reconnectMessage = `reconnect-delivery-${randomUUID()}`;
     let documentNavigations = 0;
     let historyFetches = 0;
+    const firstSendResponse = Promise.withResolvers<void>();
     try {
       await selectChannelAndSettleHistory(manager.page, channel);
       await selectChannel(member.page, channel);
@@ -281,9 +282,22 @@ test.describe("channel messaging and reconnection", () => {
 
       await sendFromComposer(member.page, reconnectMessage);
       await expect(messageWithText(manager.page, reconnectMessage)).toHaveCount(0, { timeout: 500 });
+      await manager.page.route(`${applicationOrigin}/api/channels/${channel.id}/messages`, async (route) => {
+        const response = await route.fetch();
+        expect(response.status()).toBe(201);
+        await firstSendResponse.promise;
+        await route.fulfill({ response });
+      }, { times: 1 });
       await manager.context.setOffline(false);
       await expect(manager.page.locator(".connection-status")).toContainText("подключено", { timeout: 15_000 });
+      // Сокет подтверждает отправку раньше задержанного HTTP-ответа.
+      const firstReplayed = messageWithText(manager.page, "empty-channel-queue-0-");
+      await expect(firstReplayed).toHaveCount(1);
+      await expect(feed.locator(".message-pending").filter({ hasText: "empty-channel-queue-0-" })).toHaveCount(0);
+      expect(sentRequestIds).toEqual([queuedRequestIds[0]]);
+      firstSendResponse.resolve();
       await expect(feed.locator(".message-pending")).toHaveCount(0);
+      await expect(firstReplayed).toHaveCount(1);
       await expect(feed.locator("[data-message-id]")).toHaveCount(4);
       expect(new Set(queuedRequestIds).size).toBe(3);
       expect(sentRequestIds).toEqual(queuedRequestIds);
@@ -358,6 +372,7 @@ test.describe("channel messaging and reconnection", () => {
       await expect(channelRow(manager.page, channel.id)).toBeVisible();
       await selectChannelAndSettleHistory(manager.page, channel);
     } finally {
+      firstSendResponse.resolve();
       await Promise.all([closeContextBounded(manager.context), closeContextBounded(member.context)]);
     }
   });

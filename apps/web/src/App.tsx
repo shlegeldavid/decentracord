@@ -3,22 +3,15 @@ import {
   ApiError,
   closeConversation,
   createConversation,
-  deleteConversationMessage,
-  deleteMessage,
-  editConversationMessage,
-  editMessage,
   getChannels,
   listConversations,
   markConversationRead,
   markChannelRead,
-  sendConversationMessage,
-  sendMessage,
   type Channel,
   type ChannelCategory,
   type Conversation,
   type MessageView
 } from "./api";
-import type { PendingMessage } from "./components/MessageFeed";
 import { ChannelMembersPanel } from "./components/ChannelMembersPanel";
 import { WorkspaceChannelSidebar } from "./components/WorkspaceChannelSidebar";
 import { WorkspaceChatPane } from "./components/WorkspaceChatPane";
@@ -31,23 +24,17 @@ import { PeopleSearch } from "./components/PeopleSearch";
 import { LoginScreen } from "./components/LoginScreen";
 import { SettingsModal, type SettingsSection } from "./components/SettingsModal";
 import { useChannelPins } from "./hooks/useChannelPins";
-import { useMessageHistoryPaging, useMessageHistoryState, type ApplyMessageOptions } from "./hooks/useMessageHistory";
+import { useMessageDelivery, useMessageQueue } from "./hooks/useMessageDelivery";
+import { useMessageHistoryPaging, useMessageHistoryState } from "./hooks/useMessageHistory";
 import { useTheme } from "./hooks/useTheme";
 import { useTimezone } from "./hooks/useTimezone";
 import { useWorkspaceSession, type WorkspaceBootstrap } from "./hooks/useWorkspaceSession";
-import {
-  CHANNEL_SCOPE_PREFIX,
-  CONVERSATION_SCOPE_PREFIX,
-  channelIdFromScope,
-  messageScopeKey,
-  type MessageScope
-} from "./lib/messageHistory";
+import { messageScopeKey, type MessageScope } from "./lib/messageHistory";
 import { CONVERSATION_REALTIME, connectRealtime, type RealtimeStatus } from "./realtime";
 import { bindChannelMessageEvents, bindConversationMessageEvents } from "./realtimeMessageEvents";
 import { bindChannelEvents, bindSessionEvents, subscribeToReadableChannels, type ChannelSubscriptions } from "./realtimeWorkspaceEvents";
 
 type WorkspaceOverlay = "channels" | "members" | null;
-type LocalPendingMessage = Omit<PendingMessage, "state"> & { state: PendingMessage["state"] };
 type RevokedChannel = { id: string; reason: string };
 type OpenDmMenu = { conversationId: string; position: { x: number; y: number } };
 
@@ -116,41 +103,10 @@ function readInitialDmCollapsed(): boolean {
   }
 }
 
-function rejectedSendReason(error: unknown): string {
-  if (!(error instanceof ApiError)) return "Отправка отклонена.";
-  if (error.code === "SEND_NOT_ALLOWED") return "В этом канале запрещена отправка сообщений.";
-  return error.message || "Отправка отклонена.";
-}
-
-const scopedMessageRequests = {
-  channel: {
-    prefix: CHANNEL_SCOPE_PREFIX,
-    send: sendMessage,
-    edit: editMessage,
-    remove: deleteMessage
-  },
-  conversation: {
-    prefix: CONVERSATION_SCOPE_PREFIX,
-    send: (id: string, content: string, clientRequestId: string, token: string) =>
-      sendConversationMessage(id, { content, clientRequestId }, token),
-    edit: editConversationMessage,
-    remove: deleteConversationMessage
-  }
-};
-
 // Набор живёт только на клиенте: запись гаснет через 10 с без нового
 // события, отправка ограничена одним событием в 2 с.
 const TYPING_TTL_MS = 10_000;
 const TYPING_THROTTLE_MS = 2_000;
-
-function createClientRequestId(): string {
-  if (typeof globalThis.crypto.randomUUID === "function") return globalThis.crypto.randomUUID();
-  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
-  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
-  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
-  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
 
 export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -185,7 +141,8 @@ export function App() {
   } = history;
   const [channelLastReadSeq, setChannelLastReadSeq] = useState<number | undefined>(undefined);
   const [revokedChannel, setRevokedChannel] = useState<RevokedChannel | null>(null);
-  const [pendingMessages, setPendingMessages] = useState<LocalPendingMessage[]>([]);
+  const messageQueue = useMessageQueue();
+  const { pendingMessages, resetQueue } = messageQueue;
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [messageInput, setMessageInput] = useState("");
   const [messageError, setMessageError] = useState<string | null>(null);
@@ -206,7 +163,6 @@ export function App() {
   const conversationsRef = useRef<Conversation[]>([]);
   const selectedChannelSnapshotRef = useRef<Channel | null>(null);
   const revokedChannelRef = useRef<RevokedChannel | null>(null);
-  const pendingMessagesRef = useRef<LocalPendingMessage[]>([]);
   const unreadCountsRef = useRef<Record<string, number>>({});
   // Время последнего добора списка переписок по событию сообщения в конкретную
   // переписку: не чаще одного запроса в 2 секунды на строку.
@@ -226,12 +182,6 @@ export function App() {
   // Переписка скрыта: строки в списке уже нет, но лента и история остаются.
   const isConversationHidden = hiddenConversationId !== null && selectedConversationId === hiddenConversationId;
   const openConversation = selectedConversation ?? (isConversationHidden ? hiddenConversationSnapshot : null);
-
-  const updatePendingMessages = useCallback((update: (current: LocalPendingMessage[]) => LocalPendingMessage[]) => {
-    const next = update(pendingMessagesRef.current);
-    pendingMessagesRef.current = next;
-    setPendingMessages(next);
-  }, []);
 
   // Отправка набора: не чаще одного события в 2 с на переписку. Payload — ровно
   // один ключ, логин на сервере берётся из базы.
@@ -322,8 +272,7 @@ export function App() {
     setRevokedChannel(null);
     resetHistory();
     setChannelLastReadSeq(undefined);
-    setPendingMessages([]);
-    pendingMessagesRef.current = [];
+    resetQueue();
     setConversations([]);
     setConversationsStatus("loading");
     setSelectedConversationId(null);
@@ -349,7 +298,7 @@ export function App() {
     setOpenOverlay(null);
     setChannelPropertiesTarget(null);
     setRealtimeStatus("disconnected");
-  }, [resetHistory]);
+  }, [resetHistory, resetQueue]);
 
   const {
     screen, user, organization, csrfToken, loginValue, setLoginValue, submitLogin, handleLogout,
@@ -394,11 +343,24 @@ export function App() {
     setUnreadCounts(next);
   }, []);
 
-  const applyMessage = useCallback((message: MessageView, options?: ApplyMessageOptions) => {
-    const hasGap = applyHistoryMessage(message, options);
-    updatePendingMessages((current) => current.filter((entry) => entry.clientRequestId !== message.clientRequestId));
-    return hasGap;
-  }, [applyHistoryMessage, updatePendingMessages]);
+  const isSocketConnected = useCallback(() => realtimeSocket.current?.connected === true, []);
+  const clearComposer = useCallback(() => setMessageInput(""), []);
+  const { applyMessage, requeueSending, dropUnreadableChannels, rejectChannel, replayChannels, actions: messageActions } =
+    useMessageDelivery({
+      queue: messageQueue,
+      currentUserId: user?.id,
+      csrfToken,
+      realtimeStatus,
+      isSocketConnected,
+      channelIdRef: selectedChannelIdRef,
+      conversationIdRef: selectedConversationIdRef,
+      channelsRef,
+      applyHistoryMessage,
+      markHistoryMessageDeleted,
+      clearComposer,
+      onError: setMessageError,
+      onSessionExpired: clearPrivateSession
+    });
 
   const subscribeToChannels = useCallback((items: Channel[]) => {
     subscribeToReadableChannels(realtimeSocket.current, channelSubscriptions.current, items);
@@ -686,61 +648,6 @@ export function App() {
     if (channelId) await loadHistoryPage("channel", channelId, before);
   }, [loadHistoryPage]);
 
-  const setPendingDelivery = useCallback((clientRequestId: string, delivery: Pick<PendingMessage, "state" | "reason">) => {
-    updatePendingMessages((current) => current.map((message) => message.clientRequestId === clientRequestId
-      ? { ...message, ...delivery }
-      : message));
-  }, [updatePendingMessages]);
-
-  const submitScopedMessage = useCallback(async (
-    kind: MessageScope,
-    id: string,
-    content: string,
-    clientRequestId: string,
-    token: string
-  ): Promise<void> => {
-    const { prefix, send } = scopedMessageRequests[kind];
-    const selectedId = kind === "channel" ? selectedChannelIdRef : selectedConversationIdRef;
-    const scopeKey = `${prefix}${id}`;
-    updatePendingMessages((current) => {
-      const exists = current.some((message) => message.clientRequestId === clientRequestId);
-      if (exists) {
-        return current.map((message) => message.clientRequestId === clientRequestId
-          ? { ...message, scopeKey, content, state: "sending" }
-          : message);
-      }
-      return [...current, { scopeKey, content, clientRequestId, state: "sending" }];
-    });
-    if (selectedId.current === id) setMessageError(null);
-
-    try {
-      const message = await send(id, content, clientRequestId, token);
-      applyMessage(message);
-    } catch (error: unknown) {
-      const apiError = error instanceof ApiError ? error : null;
-      if (apiError?.status === 401) {
-        clearPrivateSession();
-        return;
-      }
-      if (apiError?.status === 403 || apiError?.status === 404) {
-        const reason = kind === "channel" ? rejectedSendReason(apiError) : apiError.message || "Отправка отклонена.";
-        setPendingDelivery(clientRequestId, { state: "rejected", reason });
-        return;
-      }
-      if (!realtimeSocket.current?.connected) {
-        setPendingDelivery(clientRequestId, { state: "queued" });
-        return;
-      }
-      setPendingDelivery(clientRequestId, { state: "failed" });
-      if (selectedId.current === id) {
-        const denied = kind === "channel" && apiError?.code === "SEND_NOT_ALLOWED";
-        setMessageError(denied
-          ? "В этом канале запрещена отправка сообщений."
-          : apiError?.message ?? "Не удалось отправить сообщение. Попробуйте ещё раз.");
-      }
-    }
-  }, [applyMessage, clearPrivateSession, setPendingDelivery, updatePendingMessages]);
-
   useEffect(() => {
     if (screen !== "authenticated" || !user) return;
 
@@ -780,10 +687,7 @@ export function App() {
         if (channel.canView) forgetChannelHistory(channel.id);
         channelSubscriptions.current.delete(channel.id);
       }
-      updatePendingMessages((current) => current.filter((message) => {
-        const pendingChannelId = channelIdFromScope(message.scopeKey);
-        return pendingChannelId === null || readableChannelIds.has(pendingChannelId);
-      }));
+      dropUnreadableChannels(readableChannelIds);
     };
     const syncSelectedChannel = (items: Channel[], preserveRevocationReason: boolean) => {
       const selectedId = selectedChannelIdRef.current;
@@ -808,11 +712,6 @@ export function App() {
       replaceUnreadCounts(items, preserveUnread);
       setChannels(items);
       setCategories(categories);
-    };
-    const queueSendingMessages = () => {
-      updatePendingMessages((current) => current.map((message) =>
-        message.state === "sending" ? { ...message, state: "queued" } : message
-      ));
     };
     const refreshChannels = () => {
       void getChannels().then(({ channels: items, categories: categoryItems }) => {
@@ -855,12 +754,7 @@ export function App() {
           return false;
         }
         if (kind === "channel" && (status === 403 || status === 404)) {
-          const scopeKey = `${CHANNEL_SCOPE_PREFIX}${id}`;
-          const reason = rejectedSendReason(error);
-          updatePendingMessages((current) => current.map((message) =>
-            message.scopeKey === scopeKey && (message.state === "queued" || message.state === "sending")
-              ? { ...message, state: "rejected", reason }
-              : message));
+          rejectChannel(id, error);
           refreshChannels();
         } else {
           const selectedId = kind === "channel" ? selectedChannelIdRef : selectedConversationIdRef;
@@ -879,20 +773,7 @@ export function App() {
       if (conversationId && !await recoverOpenScope("conversation", conversationId)) return;
       void refreshConversations();
 
-      if (!csrfToken || !socket.connected) return;
-      const readableChannelIds = new Set(channelsRef.current.filter((channel) => channel.canView).map((channel) => channel.id));
-      const queuedMessages = pendingMessagesRef.current.flatMap((message) => {
-        if (message.state !== "queued") return [];
-        const queuedChannelId = channelIdFromScope(message.scopeKey);
-        return queuedChannelId !== null && readableChannelIds.has(queuedChannelId)
-          ? [{ message, channelId: queuedChannelId }]
-          : [];
-      });
-      for (const { message, channelId: queuedChannelId } of queuedMessages) {
-        if (!isCurrentConnection() || !socket.connected) break;
-        if (!pendingMessagesRef.current.some((pending) => pending.clientRequestId === message.clientRequestId)) continue;
-        await submitScopedMessage("channel", queuedChannelId, message.content, message.clientRequestId, csrfToken);
-      }
+      await replayChannels(() => isCurrentConnection() && socket.connected);
     }
 
     const onConversationMessage = (conversationId: string, message: MessageView) => {
@@ -957,7 +838,7 @@ export function App() {
         typingSentAtRef.current.clear();
         setTypingVersion((current) => current + 1);
       },
-      requeueSending: queueSendingMessages,
+      requeueSending,
       invalidate
     });
     socket.connect();
@@ -971,89 +852,12 @@ export function App() {
         realtimeSocket.current = null;
       }
     };
-  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUp, refreshConversations, csrfToken, replaceUnreadCounts, setChannelUnreadCount, submitScopedMessage, updatePendingMessages, markReadThroughAppliedMessages, markConversationReadThroughApplied, applyConversations, forgetChannelHistory, markHistoryMessageDeleted, resetHistoryStatus, setPinned]);
+  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUp, refreshConversations, replaceUnreadCounts, setChannelUnreadCount, requeueSending, dropUnreadableChannels, rejectChannel, replayChannels, markReadThroughAppliedMessages, markConversationReadThroughApplied, applyConversations, forgetChannelHistory, markHistoryMessageDeleted, resetHistoryStatus, setPinned]);
 
   useEffect(() => {
     if (screen !== "authenticated" || !user) return;
     subscribeToChannels(channels);
   }, [channels, screen, user, subscribeToChannels]);
-
-  function handleComposerSubmit(kind: MessageScope, content: string, token: string): void {
-    const id = (kind === "channel" ? selectedChannelIdRef : selectedConversationIdRef).current;
-    if (!id) return;
-    setMessageInput("");
-    const clientRequestId = createClientRequestId();
-    if (realtimeStatus !== "connected" || !realtimeSocket.current?.connected) {
-      const { prefix } = scopedMessageRequests[kind];
-      updatePendingMessages((current) => [...current, {
-        scopeKey: `${prefix}${id}`,
-        content,
-        clientRequestId,
-        state: "queued"
-      }]);
-      return;
-    }
-    void submitScopedMessage(kind, id, content, clientRequestId, token);
-  }
-
-  const handleRetryMessage = useCallback((kind: MessageScope, clientRequestId: string) => {
-    const message = pendingMessages.find((entry) => entry.clientRequestId === clientRequestId);
-    if (!message || !csrfToken) return;
-    if (realtimeStatus !== "connected" || !realtimeSocket.current?.connected) {
-      setPendingDelivery(clientRequestId, { state: "queued" });
-      return;
-    }
-    const { prefix } = scopedMessageRequests[kind];
-    if (!message.scopeKey.startsWith(prefix)) return;
-    const id = message.scopeKey.slice(prefix.length);
-    if (kind === "conversation" && !id) return;
-    void submitScopedMessage(kind, id, message.content, clientRequestId, csrfToken);
-  }, [pendingMessages, csrfToken, realtimeStatus, submitScopedMessage, setPendingDelivery]);
-
-  const handleEditMessage = useCallback(async (kind: MessageScope, messageId: string, content: string): Promise<boolean> => {
-    const selectedId = kind === "channel" ? selectedChannelIdRef : selectedConversationIdRef;
-    const id = selectedId.current;
-    if (!id || !csrfToken) return false;
-    setMessageError(null);
-    try {
-      const updated = await scopedMessageRequests[kind].edit(id, messageId, content, csrfToken);
-      applyMessage(updated);
-      return true;
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        clearPrivateSession();
-      } else if (selectedId.current === id) {
-        setMessageError(error instanceof ApiError ? error.message : "Не удалось изменить сообщение.");
-      }
-      return false;
-    }
-  }, [csrfToken, applyMessage, clearPrivateSession]);
-
-  const handleDeleteMessage = useCallback(async (kind: MessageScope, messageId: string) => {
-    const selectedId = kind === "channel" ? selectedChannelIdRef : selectedConversationIdRef;
-    const id = selectedId.current;
-    if (!id || !csrfToken) return;
-    setMessageError(null);
-    try {
-      await scopedMessageRequests[kind].remove(id, messageId, csrfToken);
-      if (selectedId.current !== id) return;
-      markHistoryMessageDeleted(messageId);
-    } catch (error) {
-      const apiError = error instanceof ApiError ? error : null;
-      if (apiError?.status === 401) {
-        clearPrivateSession();
-        return;
-      }
-      if (selectedId.current !== id) return;
-      if (kind === "conversation") {
-        setMessageError("Не удалось удалить сообщение. Попробуйте ещё раз.");
-        return;
-      }
-      setMessageError(apiError?.status === 403
-        ? "Недостаточно прав для удаления этого сообщения"
-        : apiError?.message ?? "Не удалось удалить сообщение.");
-    }
-  }, [csrfToken, clearPrivateSession, markHistoryMessageDeleted]);
 
   // Меню строки диалога: единственный пункт «Закрыть переписку».
   function handleOpenDmMenu(conversationId: string, position: { x: number; y: number }): void {
@@ -1299,12 +1103,7 @@ export function App() {
             csrfToken,
             errorMessage: messageError
           }}
-          actions={{
-            retry: handleRetryMessage,
-            edit: handleEditMessage,
-            remove: handleDeleteMessage,
-            submit: handleComposerSubmit
-          }}
+          actions={messageActions}
           channels={channels}
           categories={categories}
           conversations={conversations}
