@@ -1,29 +1,25 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiError,
-  closeConversation,
-  createConversation,
   getChannels,
-  listConversations,
   markConversationRead,
   markChannelRead,
   type Channel,
-  type ChannelCategory,
-  type Conversation,
-  type MessageView
+  type ChannelCategory
 } from "./api";
 import { ChannelMembersPanel } from "./components/ChannelMembersPanel";
 import { WorkspaceChannelSidebar } from "./components/WorkspaceChannelSidebar";
 import { WorkspaceChatPane } from "./components/WorkspaceChatPane";
-import { CreateDmDialog } from "./components/CreateDmDialog";
-import { AddDmMembersDialog } from "./components/AddDmMembersDialog";
 import { DmMembersPanel } from "./components/DmMembersPanel";
 import { DmSection } from "./components/DmSection";
+import { WorkspaceConversationControls } from "./components/WorkspaceConversationControls";
 import { AppHeader } from "./components/AppHeader";
 import { PeopleSearch } from "./components/PeopleSearch";
 import { LoginScreen } from "./components/LoginScreen";
 import { SettingsModal, type SettingsSection } from "./components/SettingsModal";
 import { useChannelPins } from "./hooks/useChannelPins";
+import { useConversationTyping } from "./hooks/useConversationTyping";
+import { useConversationActions, useConversationState } from "./hooks/useWorkspaceConversations";
 import { useMessageDelivery, useMessageQueue } from "./hooks/useMessageDelivery";
 import { useMessageHistoryPaging, useMessageHistoryState } from "./hooks/useMessageHistory";
 import { useTheme } from "./hooks/useTheme";
@@ -36,13 +32,11 @@ import { bindChannelEvents, bindSessionEvents, subscribeToReadableChannels, type
 
 type WorkspaceOverlay = "channels" | "members" | null;
 type RevokedChannel = { id: string; reason: string };
-type OpenDmMenu = { conversationId: string; position: { x: number; y: number } };
 
 const SIDEBAR_WIDTH_KEY = "decentracord:sidebar-width";
 const SIDEBAR_COLLAPSED_KEY = "decentracord:sidebar-collapsed";
 const COLLAPSED_CATEGORIES_KEY = "decentracord:sidebar-collapsed-categories";
 const COLLAPSED_UNCATEGORIZED_KEY = "decentracord:sidebar-collapsed-uncategorized";
-const COLLAPSED_DIRECT_MESSAGES_KEY = "decentracord:sidebar-collapsed-direct-messages";
 const UNCATEGORIZED_ID = "__uncategorized__";
 
 function readInitialSidebarWidth(): number {
@@ -93,27 +87,11 @@ function readInitialUncategorizedCollapsed(userId: string): boolean {
   }
 }
 
-// Свёрнутость раздела «Личные сообщения» повторяет формат категорий 03.2:
-// один ключ, значение «true» / «false», читается до первой отрисовки.
-function readInitialDmCollapsed(): boolean {
-  try {
-    return window.localStorage.getItem(COLLAPSED_DIRECT_MESSAGES_KEY) === "true";
-  } catch {
-    return false;
-  }
-}
-
-// Набор живёт только на клиенте: запись гаснет через 10 с без нового
-// события, отправка ограничена одним событием в 2 с.
-const TYPING_TTL_MS = 10_000;
-const TYPING_THROTTLE_MS = 2_000;
-
 export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("account");
   const [channels, setChannels] = useState<Channel[]>([]);
   const [categories, setCategories] = useState<ChannelCategory[]>([]);
-  const [dmMenu, setDmMenu] = useState<OpenDmMenu | null>(null);
   const [channelPropertiesTarget, setChannelPropertiesTarget] = useState<Channel | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(readInitialSidebarWidth);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readInitialSidebarCollapsed);
@@ -121,17 +99,6 @@ export function App() {
   const [uncategorizedCollapsed, setUncategorizedCollapsed] = useState(false);
   const [openOverlay, setOpenOverlay] = useState<WorkspaceOverlay>(null);
   const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
-  const [conversations, setConversations] = useState<Conversation[]>([]);
-  const [conversationsStatus, setConversationsStatus] = useState<"loading" | "ready" | "error">("loading");
-  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
-  // Открытая переписка, исчезнувшая из списка из-за отключения собеседника.
-  const [hiddenConversationId, setHiddenConversationId] = useState<string | null>(null);
-  const [hiddenConversationSnapshot, setHiddenConversationSnapshot] = useState<Conversation | null>(null);
-  const [dmAnnouncement, setDmAnnouncement] = useState("");
-  const [dmMembersAnnouncement, setDmMembersAnnouncement] = useState("");
-  const [createDmOpen, setCreateDmOpen] = useState(false);
-  const [addDmMembersOpen, setAddDmMembersOpen] = useState(false);
-  const [dmCollapsed, setDmCollapsed] = useState(readInitialDmCollapsed);
   const [accessDeniedChannelId, setAccessDeniedChannelId] = useState<string | null>(null);
   const [expandedChannelTopicId, setExpandedChannelTopicId] = useState<string | null>(null);
   const history = useMessageHistoryState();
@@ -149,7 +116,6 @@ export function App() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>("connecting");
   const appShellElementRef = useRef<HTMLElement | null>(null);
-  const dmMenuRef = useRef<HTMLDivElement | null>(null);
   const overlayPanelRef = useRef<HTMLElement | null>(null);
   const overlayReturnFocusRef = useRef<HTMLElement | null>(null);
   const appShellRef = useCallback((element: HTMLElement | null) => {
@@ -159,77 +125,35 @@ export function App() {
   const realtimeSocket = useRef<ReturnType<typeof connectRealtime> | null>(null);
   const channelsRef = useRef<Channel[]>([]);
   const selectedChannelIdRef = useRef<string | null>(null);
-  const selectedConversationIdRef = useRef<string | null>(null);
-  const conversationsRef = useRef<Conversation[]>([]);
   const selectedChannelSnapshotRef = useRef<Channel | null>(null);
   const revokedChannelRef = useRef<RevokedChannel | null>(null);
   const unreadCountsRef = useRef<Record<string, number>>({});
-  // Время последнего добора списка переписок по событию сообщения в конкретную
-  // переписку: не чаще одного запроса в 2 секунды на строку.
-  const conversationRefreshAtRef = useRef(new Map<string, number>());
   const channelSubscriptions = useRef<ChannelSubscriptions>(new Map());
-  // Состояние набора живёт только здесь: карта «переписка → кто печатает»
-  // с временем истечения и карта времени последней отправки на переписку.
-  const typingRef = useRef(new Map<string, Map<string, { login: string; expiresAt: number }>>());
-  const typingSentAtRef = useRef(new Map<string, number>());
-  // Счётчик изменений карты набора: `Map` мутируется в обработчике ради
-  // отсутствия лишних состояний, а перерисовку запрашивает версия.
-  const [typingVersion, setTypingVersion] = useState(0);
+
+  const leaveChannelForConversation = useCallback(() => {
+    setSelectedChannelId(null);
+    selectedChannelIdRef.current = null;
+    selectedChannelSnapshotRef.current = null;
+    setAccessDeniedChannelId(null);
+    setExpandedChannelTopicId(null);
+  }, []);
+  const conversationState = useConversationState({ leaveChannel: leaveChannelForConversation, clearHistory });
+  const {
+    conversations, selectedId: selectedConversationId, selectedIdRef: selectedConversationIdRef,
+    selectedConversation, openConversation, isConversationHidden, loadConversations, resetConversations,
+    applyConversations, clearUnread, selectConversation, deselectConversation, closeOpenConversation
+  } = conversationState;
+  const sendTyping = useCallback((conversationId: string): boolean => {
+    const socket = realtimeSocket.current;
+    if (!socket?.connected) return false;
+    socket.emit(CONVERSATION_REALTIME.typing, { conversationId });
+    return true;
+  }, []);
+  const { emitTyping, recordTyping, clearTyping, typingByConversation, typingLabelFor } = useConversationTyping(sendTyping);
+
   const selectedChannel = revokedChannel?.id === selectedChannelId
     ? selectedChannelSnapshotRef.current
     : channels.find((channel) => channel.id === selectedChannelId) ?? null;
-  const selectedConversation = conversations.find((conversation) => conversation.id === selectedConversationId) ?? null;
-  // Переписка скрыта: строки в списке уже нет, но лента и история остаются.
-  const isConversationHidden = hiddenConversationId !== null && selectedConversationId === hiddenConversationId;
-  const openConversation = selectedConversation ?? (isConversationHidden ? hiddenConversationSnapshot : null);
-
-  // Отправка набора: не чаще одного события в 2 с на переписку. Payload — ровно
-  // один ключ, логин на сервере берётся из базы.
-  const emitTyping = useCallback((conversationId: string) => {
-    const now = Date.now();
-    if (now - (typingSentAtRef.current.get(conversationId) ?? 0) < TYPING_THROTTLE_MS) return;
-    typingSentAtRef.current.set(conversationId, now);
-    realtimeSocket.current?.emit(CONVERSATION_REALTIME.typing, { conversationId });
-  }, []);
-
-  // Один таймер на приложение: истёкшие записи удаляются, пустые внутренние
-  // карты чистятся, перерисовка запрашивается только при изменении.
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      const now = Date.now();
-      let changed = false;
-      for (const [conversationId, entries] of typingRef.current) {
-        for (const [userId, entry] of entries) {
-          if (entry.expiresAt > now) continue;
-          entries.delete(userId);
-          changed = true;
-        }
-        if (entries.size === 0) typingRef.current.delete(conversationId);
-      }
-      if (changed) setTypingVersion((value) => value + 1);
-    }, 1_000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  // Производные значения по версии карты: логины печатающих по переписке и
-  // строка над композером. Если печатают несколько участников, имена скрыты.
-  const typingByConversation = useMemo(() => {
-    void typingVersion;
-    const result = new Map<string, { logins: string[] }>();
-    for (const [conversationId, entries] of typingRef.current) {
-      if (entries.size === 0) continue;
-      result.set(conversationId, { logins: [...entries.values()].map((entry) => entry.login) });
-    }
-    return result;
-  }, [typingVersion]);
-
-  const typingLabelFor = useCallback((conversationId: string): string | null => {
-    const logins = typingByConversation.get(conversationId)?.logins ?? [];
-    if (logins.length === 0) return null;
-    if (logins.length === 1) return `${logins[0]} печатает…`;
-    return "Печатают…";
-  }, [typingByConversation]);
-
   const replaceUnreadCounts = useCallback((items: Channel[], preserveCurrent: boolean) => {
     const current = unreadCountsRef.current;
     const next: Record<string, number> = {};
@@ -246,11 +170,7 @@ export function App() {
     if (data) {
       setCollapsedCategoryIds(readInitialCollapsedCategories(data.user.id));
       setUncategorizedCollapsed(readInitialUncategorizedCollapsed(data.user.id));
-      if (data.conversations !== undefined) {
-        setDmCollapsed(readInitialDmCollapsed());
-        setConversations(data.conversations ?? []);
-        setConversationsStatus(data.conversations === null ? "error" : "ready");
-      }
+      if (data.conversations !== undefined) loadConversations(data.conversations);
     }
     const items = data?.channelData.channels ?? [];
     channelsRef.current = items;
@@ -258,7 +178,7 @@ export function App() {
     setChannels(items);
     setCategories(data?.channelData.categories ?? []);
     setSelectedChannelId(null);
-  }, [replaceUnreadCounts]);
+  }, [loadConversations, replaceUnreadCounts]);
 
   const clearWorkspace = useCallback(() => {
     realtimeSocket.current?.disconnect();
@@ -266,39 +186,25 @@ export function App() {
     setAccessDeniedChannelId(null);
     setExpandedChannelTopicId(null);
     selectedChannelIdRef.current = null;
-    selectedConversationIdRef.current = null;
     selectedChannelSnapshotRef.current = null;
     revokedChannelRef.current = null;
     setRevokedChannel(null);
     resetHistory();
     setChannelLastReadSeq(undefined);
     resetQueue();
-    setConversations([]);
-    setConversationsStatus("loading");
-    setSelectedConversationId(null);
-    setCreateDmOpen(false);
-    setAddDmMembersOpen(false);
-    setDmMenu(null);
-    setHiddenConversationId(null);
-    setHiddenConversationSnapshot(null);
-    setDmAnnouncement("");
-    setDmMembersAnnouncement("");
-    conversationsRef.current = [];
-    conversationRefreshAtRef.current.clear();
+    resetConversations();
     // На экране входа заголовок вкладки не показывает непрочитанные сообщения.
     document.title = "Decentracord";
     setMessageInput("");
     setMessageError(null);
     channelSubscriptions.current.clear();
-    typingRef.current.clear();
-    typingSentAtRef.current.clear();
-    setTypingVersion((value) => value + 1);
+    clearTyping();
     setSettingsOpen(false);
     setSettingsSection("account");
     setOpenOverlay(null);
     setChannelPropertiesTarget(null);
     setRealtimeStatus("disconnected");
-  }, [resetHistory, resetQueue]);
+  }, [clearTyping, resetConversations, resetHistory, resetQueue]);
 
   const {
     screen, user, organization, csrfToken, loginValue, setLoginValue, submitLogin, handleLogout,
@@ -372,10 +278,6 @@ export function App() {
     if (selected?.canView && revokedChannelRef.current?.id !== selected.id) selectedChannelSnapshotRef.current = selected;
   }, [channels, selectedChannelId]);
 
-  useEffect(() => {
-    conversationsRef.current = conversations;
-  }, [conversations]);
-
   // Заголовок вкладки: сумма непрочитанных по каналам и по перепискам
   // вместе. Только `title` — звука и системных уведомлений нет.
   useEffect(() => {
@@ -388,22 +290,8 @@ export function App() {
         : `(${total}) Decentracord`;
   }, [unreadCounts, conversations]);
 
-  // Меню строки диалога: фокус переходит на пункт, клик вне меню его закрывает.
-  useEffect(() => {
-    if (!dmMenu) return;
-    dmMenuRef.current?.querySelector<HTMLButtonElement>("[role='menuitem']")?.focus();
-    const closeOnOutside = (event: PointerEvent) => {
-      const target = event.target;
-      if (target instanceof Element && target.closest(".context-menu") !== null) return;
-      setDmMenu(null);
-    };
-    document.addEventListener("pointerdown", closeOnOutside);
-    return () => document.removeEventListener("pointerdown", closeOnOutside);
-  }, [dmMenu]);
-
   useEffect(() => {
     selectedChannelIdRef.current = selectedChannelId;
-    selectedConversationIdRef.current = selectedConversationId;
     setSelectedScope(selectedConversationId
       ? messageScopeKey("conversation", selectedConversationId)
       : selectedChannelId ? messageScopeKey("channel", selectedChannelId) : null);
@@ -421,74 +309,6 @@ export function App() {
     onSessionExpired: clearPrivateSession
   });
   const { setPinned } = channelPins;
-
-  // Общий путь применения списка переписок: и полный ответ сервера, и добор по
-  // сигналу `conversations: null`. Исчезновение открытой переписки — признак
-  // отключения собеседника: показываем карточку, историю не стираем.
-  const applyConversations = useCallback((items: Conversation[]) => {
-    setConversations(items);
-    setConversationsStatus("ready");
-    const selectedId = selectedConversationIdRef.current;
-    if (selectedId === null) return;
-    if (items.some((conversation) => conversation.id === selectedId)) {
-      setHiddenConversationId((current) => (current === selectedId ? null : current));
-      return;
-    }
-    const previous = conversationsRef.current.find((conversation) => conversation.id === selectedId);
-    if (previous) setHiddenConversationSnapshot(previous);
-    setHiddenConversationId(selectedId);
-  }, []);
-
-  const refreshConversations = useCallback(() => {
-    setConversationsStatus("loading");
-    return listConversations()
-      .then((items) => applyConversations(items))
-      .catch((error: unknown) => {
-        if (error instanceof ApiError && error.status === 401) {
-          clearPrivateSession();
-          return;
-        }
-        setConversationsStatus("error");
-      });
-  }, [applyConversations, clearPrivateSession]);
-
-  const toggleDmCollapsed = useCallback(() => {
-    setDmCollapsed((current) => {
-      const next = !current;
-      try {
-        window.localStorage.setItem(COLLAPSED_DIRECT_MESSAGES_KEY, String(next));
-      } catch {
-        // Раздел остаётся рабочим, когда хранилище браузера недоступно.
-      }
-      return next;
-    });
-  }, []);
-
-  // Выбор переписки и выбор канала взаимоисключающие: открытая переписка живёт
-  // в центральной ленте.
-  const selectConversation = useCallback((conversationId: string) => {
-    setSelectedConversationId(conversationId);
-    setSelectedChannelId(null);
-    selectedChannelIdRef.current = null;
-    selectedChannelSnapshotRef.current = null;
-    setAccessDeniedChannelId(null);
-    setExpandedChannelTopicId(null);
-    clearHistory();
-    // Счётчик строки сбрасывается сразу; серверный курсор прочтения двигает
-    // эффект применения первой страницы истории.
-    setConversations((current) => current.map((conversation) => conversation.id === conversationId
-      ? { ...conversation, unreadCount: 0 }
-      : conversation));
-    setHiddenConversationId(null);
-    setHiddenConversationSnapshot(null);
-  }, [clearHistory]);
-
-  const startConversationWith = useCallback(async (participantId: string): Promise<void> => {
-    if (!csrfToken) throw new Error("Не удалось подготовить защищённый запрос");
-    const conversation = await createConversation([participantId], csrfToken);
-    await refreshConversations();
-    selectConversation(conversation.id);
-  }, [csrfToken, refreshConversations, selectConversation]);
 
   const markReadThroughAppliedMessages = useCallback((channelId: string) => {
     if (!csrfToken) return;
@@ -515,6 +335,16 @@ export function App() {
     });
   }, [csrfToken, clearPrivateSession, getMaxAppliedSeq]);
 
+  const conversationActions = useConversationActions({
+    state: conversationState,
+    csrfToken,
+    userId: user?.id,
+    markRead: markConversationReadThroughApplied,
+    onError: setErrorMessage,
+    onSessionExpired: clearPrivateSession
+  });
+  const { refreshConversations, onMessageCreated, startConversationWith } = conversationActions;
+
   const selectChannel = useCallback((channelId: string) => {
     const channel = channelsRef.current.find((item) => item.id === channelId);
     if (!channel?.canView) return;
@@ -528,10 +358,10 @@ export function App() {
     if (changedChannel) resetHistoryStatus("loading");
     selectedChannelIdRef.current = channelId;
     setSelectedChannelId(channelId);
-    setSelectedConversationId(null);
+    deselectConversation();
     setChannelUnreadCount(channelId, 0);
     markReadThroughAppliedMessages(channelId);
-  }, [markReadThroughAppliedMessages, resetHistoryStatus, setChannelUnreadCount]);
+  }, [deselectConversation, markReadThroughAppliedMessages, resetHistoryStatus, setChannelUnreadCount]);
 
   const leaveRevokedChannel = useCallback(() => {
     revokedChannelRef.current = null;
@@ -776,31 +606,6 @@ export function App() {
       await replayChannels(() => isCurrentConnection() && socket.connected);
     }
 
-    const onConversationMessage = (conversationId: string, message: MessageView) => {
-      const isOpen = selectedConversationIdRef.current === conversationId;
-      const known = conversationsRef.current.some((conversation) => conversation.id === conversationId);
-      // Строка обновляется локально: сервер не рассылает список на каждое сообщение.
-      setConversations((current) => {
-        const index = current.findIndex((conversation) => conversation.id === conversationId);
-        const target = current[index];
-        if (!target) return current;
-        const unreadCount = isOpen || message.authorId === user.id ? target.unreadCount : target.unreadCount + 1;
-        const updated = { ...target, lastMessageAt: message.createdAt, unreadCount };
-        return [updated, ...current.filter((_, position) => position !== index)];
-      });
-
-      if (!known) {
-        // Закрытый диалог возвращается одним добором списка, не чаще раза в 2 с.
-        const lastRefresh = conversationRefreshAtRef.current.get(conversationId) ?? 0;
-        if (Date.now() - lastRefresh > 2_000) {
-          conversationRefreshAtRef.current.set(conversationId, Date.now());
-          void refreshConversations();
-        }
-        return;
-      }
-      if (isOpen) markConversationReadThroughApplied(conversationId);
-    };
-
     bindChannelMessageEvents(socket, user.id, {
       canView: (channelId) => findChannel(channelId)?.canView === true,
       isSelected: (channelId) => selectedChannelIdRef.current === channelId,
@@ -814,29 +619,20 @@ export function App() {
     bindConversationMessageEvents(socket, user.id, {
       apply: applyMessage,
       isSelected: (conversationId) => selectedConversationIdRef.current === conversationId,
-      onCreated: onConversationMessage,
+      onCreated: onMessageCreated,
       remove: ({ scopeId, messageId, updatedSeq }) =>
         markHistoryMessageDeleted(messageId, { scopeKey: messageScopeKey("conversation", scopeId), updatedSeq }),
       replaceConversations: applyConversations,
       refreshConversations,
-      clearUnread: (conversationId) => setConversations((current) => current.map((conversation) =>
-        conversation.id === conversationId ? { ...conversation, unreadCount: 0 } : conversation)),
-      recordTyping: (conversationId, userId, login) => {
-        const entries = typingRef.current.get(conversationId) ?? new Map<string, { login: string; expiresAt: number }>();
-        entries.set(userId, { login, expiresAt: Date.now() + TYPING_TTL_MS });
-        typingRef.current.set(conversationId, entries);
-        setTypingVersion((current) => current + 1);
-      }
+      clearUnread,
+      recordTyping
     });
     bindSessionEvents(socket, {
       ready: () => void recoverAfterReconnect(),
       setStatus: setRealtimeStatus,
       clearConnection: () => {
         channelSubscriptions.current.clear();
-        // События набора не догоняются после переподключения.
-        typingRef.current.clear();
-        typingSentAtRef.current.clear();
-        setTypingVersion((current) => current + 1);
+        clearTyping();
       },
       requeueSending,
       invalidate
@@ -852,73 +648,12 @@ export function App() {
         realtimeSocket.current = null;
       }
     };
-  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUp, refreshConversations, replaceUnreadCounts, setChannelUnreadCount, requeueSending, dropUnreadableChannels, rejectChannel, replayChannels, markReadThroughAppliedMessages, markConversationReadThroughApplied, applyConversations, forgetChannelHistory, markHistoryMessageDeleted, resetHistoryStatus, setPinned]);
+  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUp, refreshConversations, replaceUnreadCounts, setChannelUnreadCount, requeueSending, dropUnreadableChannels, rejectChannel, replayChannels, markReadThroughAppliedMessages, applyConversations, forgetChannelHistory, markHistoryMessageDeleted, resetHistoryStatus, setPinned, onMessageCreated, clearUnread, recordTyping, clearTyping, selectedConversationIdRef]);
 
   useEffect(() => {
     if (screen !== "authenticated" || !user) return;
     subscribeToChannels(channels);
   }, [channels, screen, user, subscribeToChannels]);
-
-  // Меню строки диалога: единственный пункт «Закрыть переписку».
-  function handleOpenDmMenu(conversationId: string, position: { x: number; y: number }): void {
-    setDmMenu({
-      conversationId,
-      position: {
-        x: Math.max(8, Math.min(position.x, window.innerWidth - 208)),
-        y: Math.max(8, Math.min(position.y, window.innerHeight - 56))
-      }
-    });
-  }
-
-  function focusDmRow(conversationId: string): void {
-    window.requestAnimationFrame(() => {
-      document.querySelector<HTMLElement>(`[data-dm-id="${conversationId}"] .dm-row-select`)?.focus();
-    });
-  }
-
-  function closeDmMenuAndRestoreFocus(conversationId: string): void {
-    setDmMenu(null);
-    focusDmRow(conversationId);
-  }
-
-  // Закрытие выполняется сразу, без подтверждения: действие обратимо — новое
-  // сообщение возвращает переписку в список.
-  async function handleCloseConversation(conversationId: string): Promise<void> {
-    setDmMenu(null);
-    if (!csrfToken) return;
-    try {
-      await closeConversation(conversationId, csrfToken);
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        clearPrivateSession();
-        return;
-      }
-      setErrorMessage("Не удалось закрыть переписку. Попробуйте ещё раз.");
-      return;
-    }
-
-    const previous = conversationsRef.current;
-    const closedIndex = previous.findIndex((conversation) => conversation.id === conversationId);
-    const remaining = previous.filter((conversation) => conversation.id !== conversationId);
-    conversationsRef.current = remaining;
-    setConversations(remaining);
-    setDmAnnouncement("Переписка закрыта.");
-    if (selectedConversationIdRef.current === conversationId) {
-      setSelectedConversationId(null);
-      selectedConversationIdRef.current = null;
-      clearHistory();
-      setHiddenConversationId(null);
-      setHiddenConversationSnapshot(null);
-    }
-
-    // Фокус — на следующую строку, а если строк не осталось — на «Начать переписку».
-    window.requestAnimationFrame(() => {
-      const rows = [...document.querySelectorAll<HTMLElement>(".dm-section .dm-row-select")];
-      const target = rows[Math.min(Math.max(closedIndex, 0), rows.length - 1)]
-        ?? document.querySelector<HTMLElement>(".dm-section-add");
-      target?.focus();
-    });
-  }
 
   if (screen !== "authenticated" || !user || !organization || !csrfToken) {
     return (
@@ -982,15 +717,15 @@ export function App() {
               selectedConversationId={selectedConversationId}
               currentUserId={user.id}
               typingByConversation={typingByConversation}
-              collapsed={dmCollapsed}
-              onToggleCollapsed={toggleDmCollapsed}
-              onCreate={() => setCreateDmOpen(true)}
+              collapsed={conversationState.collapsed}
+              onToggleCollapsed={conversationState.toggleCollapsed}
+              onCreate={() => conversationState.setCreateOpen(true)}
               onSelect={(conversationId) => {
                 selectConversation(conversationId);
                 if (openOverlay === "channels") closeOverlay();
               }}
-              onCloseRequest={handleOpenDmMenu}
-              status={conversationsStatus}
+              onCloseRequest={conversationState.openMenu}
+              status={conversationState.status}
               onRetry={() => void refreshConversations()}
             />
           )}
@@ -1019,52 +754,12 @@ export function App() {
           onCloseOverlay={closeOverlay}
           {...(openOverlay === "channels" ? { dialogRef: setOverlayPanelElement } : {})}
         />
-        {dmMenu && (
-          <div
-            ref={dmMenuRef}
-            className="context-menu"
-            role="menu"
-            aria-label="Действия с перепиской"
-            style={{ left: dmMenu.position.x, top: dmMenu.position.y }}
-            onKeyDown={(event) => {
-              if (event.key !== "Escape") return;
-              event.preventDefault();
-              closeDmMenuAndRestoreFocus(dmMenu.conversationId);
-            }}
-          >
-            <button
-              type="button"
-              role="menuitem"
-              className="context-menu-item"
-              onClick={() => void handleCloseConversation(dmMenu.conversationId)}
-            >
-              <span>Закрыть переписку</span>
-            </button>
-          </div>
-        )}
-        <CreateDmDialog
-          open={createDmOpen}
-          onClose={() => setCreateDmOpen(false)}
+        <WorkspaceConversationControls
+          state={conversationState}
+          actions={conversationActions}
           csrfToken={csrfToken}
-          onCreated={(conversation) => {
-            void refreshConversations();
-            selectConversation(conversation.id);
-          }}
           onSessionExpired={clearPrivateSession}
         />
-        {selectedConversation?.kind === "group" && (
-          <AddDmMembersDialog
-            open={addDmMembersOpen}
-            onClose={() => setAddDmMembersOpen(false)}
-            conversation={selectedConversation}
-            csrfToken={csrfToken}
-            onAdded={(announcement) => {
-              setDmMembersAnnouncement(announcement);
-              void refreshConversations();
-            }}
-            onSessionExpired={clearPrivateSession}
-          />
-        )}
         <WorkspaceChatPane
           key={user.id}
           inactive={openOverlay !== null}
@@ -1075,12 +770,7 @@ export function App() {
             hidden: isConversationHidden,
             typingLabel: selectedConversationId ? typingLabelFor(selectedConversationId) : null,
             onType: () => { if (selectedConversationId) emitTyping(selectedConversationId); },
-            onBack: () => {
-              setSelectedConversationId(null);
-              setHiddenConversationId(null);
-              setHiddenConversationSnapshot(null);
-              clearHistory();
-            }
+            onBack: closeOpenConversation
           } : selectedChannel ? {
             kind: "channel",
             channel: selectedChannel,
@@ -1111,7 +801,7 @@ export function App() {
           pins={channelPins}
           topicExpanded={expandedChannelTopicId === selectedChannelId}
           accessDenied={accessDeniedChannelId !== null}
-          dmAnnouncements={[dmAnnouncement, dmMembersAnnouncement]}
+          dmAnnouncements={[conversationState.announcement, conversationState.membersAnnouncement]}
           onToggleTopic={(id) => setExpandedChannelTopicId((current) => current === id ? null : id)}
           onOpenProperties={setChannelPropertiesTarget}
           onLeaveRevokedChannel={leaveRevokedChannel}
@@ -1137,7 +827,7 @@ export function App() {
               currentUserId={user.id}
               csrfToken={csrfToken}
               onMembersChanged={() => void refreshConversations()}
-              onOpenAddMembers={() => setAddDmMembersOpen(true)}
+              onOpenAddMembers={() => conversationState.setAddMembersOpen(true)}
               onSessionExpired={clearPrivateSession}
             />
           ) : (

@@ -462,17 +462,31 @@ test.describe("personal messages in the sidebar", () => {
       if (!conversationId) throw new Error("Conversation row has no identifier");
 
       // Контекстное меню строки: единственный пункт «Закрыть переписку».
-      await member.page.locator(`[data-dm-id="${conversationId}"] .dm-row-select`).click({ button: "right" });
+      const rowButton = row.locator(".dm-row-select");
+      await rowButton.click({ button: "right" });
       const menuItem = member.page.getByRole("menuitem", { name: "Закрыть переписку" });
-      await expect(menuItem).toBeVisible();
-      await menuItem.click();
+      await expect(menuItem).toBeFocused();
+      await menuItem.press("Escape");
+      await expect(menuItem).toHaveCount(0);
+      await expect(rowButton).toBeFocused();
 
+      await member.page.route(`${applicationOrigin}/api/conversations/${conversationId}/close`, (route) =>
+        route.fulfill({ status: 500, json: { error: { code: "INTERNAL", message: "Ошибка закрытия" } } }), { times: 1 });
+      await rowButton.click({ button: "right" });
+      await menuItem.click();
+      await expect(member.page.getByRole("alert")).toHaveText("Не удалось закрыть переписку. Попробуйте ещё раз.");
+      await expect(menuItem).toHaveCount(0);
+      await expect(rowButton).toBeVisible();
+
+      await rowButton.click({ button: "right" });
+      await menuItem.click();
       await expect(member.page.locator(`[data-dm-id="${conversationId}"]`)).toHaveCount(0);
       await expect(
         member.page.locator(".chat-pane .visually-hidden[aria-live='polite']").filter({ hasText: "Переписка закрыта." })
       ).toHaveCount(1);
       // Открытая переписка закрылась: лента вернулась к пустому состоянию выбора.
       await expect(member.page.getByText("Выберите канал слева, чтобы открыть переписку.")).toBeVisible();
+      await expect(member.page.getByRole("button", { name: "Начать переписку", exact: true })).toBeFocused();
 
       const peer = await newAuthenticatedPage(browser, messagingSeed.manager);
       try {
@@ -652,6 +666,15 @@ test.describe("personal messages in the sidebar", () => {
         await expect(peer.page.locator(".connection-status")).toContainText("подключено", { timeout: 15_000 });
         // Без нового набора карта не восстанавливается: сервер состояние не хранит.
         await peer.page.waitForTimeout(3_000);
+        await expect(indicator).toHaveText("");
+        await expect(peerRow.locator(".dm-row-avatar.is-typing")).toHaveCount(0);
+
+        await author.context.setOffline(true);
+        await expect(author.page.locator(".connection-status")).toContainText("нет связи", { timeout: 15_000 });
+        await composer.pressSequentially("Черновик без связи", { delay: 60 });
+        await author.context.setOffline(false);
+        await expect(author.page.locator(".connection-status")).toContainText("подключено", { timeout: 15_000 });
+        await peer.page.waitForTimeout(2_000);
         await expect(indicator).toHaveText("");
         await expect(peerRow.locator(".dm-row-avatar.is-typing")).toHaveCount(0);
 
