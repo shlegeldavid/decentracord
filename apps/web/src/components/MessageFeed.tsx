@@ -1,7 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import type { MessageView } from "../api.js";
-import { getMessages } from "../api.js";
 import type { Theme } from "../lib/roles";
 import { useMessageFeedScroll } from "../hooks/useMessageFeedScroll";
 import { DayDivider, JumpToLatestBar, NewMessagesDivider } from "./FeedDecorations";
@@ -11,12 +10,6 @@ import { MessageFeedRow, cancelMessageLongPress, type LongPressState } from "./M
 import { PendingMessageList, type PendingMessage } from "./PendingMessageList";
 
 export type { PendingMessage } from "./PendingMessageList";
-
-export function getEarlierMessagePage(channelId: string, before: number | undefined) {
-  return before === undefined
-    ? getMessages(channelId, { limit: 50 })
-    : getMessages(channelId, { before, limit: 50 });
-}
 
 interface MessageMenuState {
   message: MessageView;
