@@ -1,14 +1,8 @@
 import { MessageMarkdown } from "../markdown/MessageMarkdown";
+import type { PendingMessage } from "../lib/messageOutbox";
 import { ClockIcon } from "./icons";
 
-// Ключ области совпадает с ключом курсора канала или переписки.
-export interface PendingMessage {
-  clientRequestId: string;
-  scopeKey: string;
-  content: string;
-  state: "sending" | "failed" | "queued" | "rejected";
-  reason?: string;
-}
+export type { PendingMessage } from "../lib/messageOutbox";
 
 function PendingMessageStatus({ message, onRetry }: { message: PendingMessage; onRetry: (id: string) => void }) {
   switch (message.state) {

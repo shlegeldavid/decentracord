@@ -11,7 +11,7 @@ export function messageScopeKey(kind: MessageScope, id: string): ScopeKey {
   return `${kind}:${id}`;
 }
 
-export function scopeKeyOf(message: MessageView): ScopeKey {
+export function scopeKeyOf(message: Pick<MessageView, "channelId" | "conversationId">): ScopeKey {
   return message.conversationId
     ? messageScopeKey("conversation", message.conversationId)
     : `${CHANNEL_SCOPE_PREFIX}${message.channelId}`;
