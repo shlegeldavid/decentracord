@@ -4,9 +4,19 @@ import { AccessService } from "../access/access.service.js";
 import { evaluateChannelAccess, isPermission, type AccessFacts, type OverrideFact, type Permission, PERMISSIONS } from "../access/permissions.js";
 import type { AuthPrincipal } from "../auth/session.service.js";
 import { RealtimeGateway } from "../realtime/realtime.gateway.js";
-
-type ChannelSubject = "everyone" | "role" | "member";
-type OverrideEffect = "allow" | "deny";
+import {
+  isUuid,
+  parseCategoryNameBody,
+  parseChannelOverridesBody,
+  parseCreateChannelBody,
+  parseReorderCategoriesBody,
+  parseReorderChannelsBody,
+  parseUpdateChannelBody,
+  type ChannelOrderGroup,
+  type ChannelSubject,
+  type OverrideEffect,
+  type OverrideInput
+} from "./channels.dto.js";
 
 interface ChannelRow {
   id: string;
@@ -57,31 +67,6 @@ interface ChannelOverride {
   effect: OverrideEffect;
 }
 
-interface OverrideInput {
-  subject: ChannelSubject;
-  subjectId: string | null;
-  permission: Permission;
-  effect: OverrideEffect | "unset";
-}
-
-interface CreateChannelInput {
-  name: string;
-  description: string | null;
-  categoryId: string | null;
-  overrides: OverrideInput[];
-}
-
-interface ChannelOrderGroup {
-  categoryId: string | null;
-  channelIds: string[];
-}
-
-const channelOverridePermissions = new Set<Permission>([
-  "VIEW_CHANNEL",
-  "SEND_MESSAGES",
-  "MANAGE_MESSAGES"
-]);
-
 function apiError(status: number, code: string, message: string): HttpException {
   return new HttpException({ code, message }, status);
 }
@@ -92,6 +77,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function hasErrorCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+function matchesIds<T>(actual: ReadonlySet<T>, expected: ReadonlySet<T>): boolean {
+  return actual.size === expected.size && [...actual].every((id) => expected.has(id));
 }
 
 function jsonArray(value: unknown): unknown[] {
@@ -126,189 +115,6 @@ function overrideArray(value: unknown): OverrideFact[] {
     } else if (entry.subject === "member" && typeof entry.subjectId === "string") {
       overrides.push({ subject: "member", subjectId: entry.subjectId, permission: entry.permission, effect: entry.effect });
     }
-  }
-  return overrides;
-}
-
-function isUuid(value: unknown): value is string {
-  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
-}
-
-function parseChannelName(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const name = value.trim();
-  const length = Array.from(name).length;
-  if (length < 1 || length > 80 || name.includes("\u0000")) return null;
-  return name;
-}
-
-function parseCategoryName(value: unknown): string | null {
-  if (typeof value !== "string") return null;
-  const name = value.trim();
-  const length = Array.from(name).length;
-  if (length < 1 || length > 80 || name.includes("\u0000")) return null;
-  return name;
-}
-
-function parseCreateCategory(value: unknown): { name: string } | null {
-  if (!isRecord(value) || Object.keys(value).some((key) => key !== "name") || !Object.hasOwn(value, "name")) return null;
-  const name = parseCategoryName(value.name);
-  return name === null ? null : { name };
-}
-
-function parseNameBody(value: unknown, allowedKeys: readonly string[]): { name: string } | null {
-  if (!isRecord(value) || !Object.hasOwn(value, "name") || Object.keys(value).some((key) => !allowedKeys.includes(key))) return null;
-  const name = parseChannelName(value.name);
-  return name === null ? null : { name };
-}
-
-function parseCreateChannelBody(value: unknown): CreateChannelInput | null {
-  const named = parseNameBody(value, ["name", "description", "categoryId", "overrides"]);
-  if (!named || !isRecord(value)) return null;
-
-  let description: string | null = null;
-  if (Object.hasOwn(value, "description")) {
-    if (
-      value.description !== null &&
-      (typeof value.description !== "string" || Array.from(value.description).length > 1024 || value.description.includes("\u0000"))
-    ) return null;
-    description = value.description as string | null;
-  }
-
-  let categoryId: string | null = null;
-  if (Object.hasOwn(value, "categoryId")) {
-    if (value.categoryId !== null && !isUuid(value.categoryId)) return null;
-    categoryId = value.categoryId as string | null;
-  }
-
-  let overrides: OverrideInput[] = [];
-  if (Object.hasOwn(value, "overrides")) {
-    const parsed = parseOverrides({ overrides: value.overrides });
-    if (!parsed || parsed.some((override) => !channelOverridePermissions.has(override.permission))) return null;
-    overrides = parsed;
-  }
-
-  return { name: named.name, description, categoryId, overrides };
-}
-
-function parseUpdateChannelBody(value: unknown): {
-  name?: string;
-  categoryId?: string | null;
-  description?: string | null;
-  visibility?: "hidden" | "known";
-} | null {
-  if (
-    !isRecord(value) ||
-    Object.keys(value).length === 0 ||
-    Object.keys(value).some((key) => !["name", "categoryId", "description", "visibility"].includes(key))
-  ) {
-    return null;
-  }
-
-  const input: {
-    name?: string;
-    categoryId?: string | null;
-    description?: string | null;
-    visibility?: "hidden" | "known";
-  } = {};
-  if (Object.hasOwn(value, "name")) {
-    const name = parseChannelName(value.name);
-    if (name === null) return null;
-    input.name = name;
-  }
-  if (Object.hasOwn(value, "categoryId")) {
-    if (value.categoryId !== null && !isUuid(value.categoryId)) return null;
-    input.categoryId = value.categoryId as string | null;
-  }
-  if (Object.hasOwn(value, "description")) {
-    if (
-      value.description !== null &&
-      (typeof value.description !== "string" || Array.from(value.description).length > 1024 || value.description.includes("\u0000"))
-    ) return null;
-    input.description = value.description as string | null;
-  }
-  if (Object.hasOwn(value, "visibility")) {
-    if (value.visibility !== "hidden" && value.visibility !== "known") return null;
-    input.visibility = value.visibility;
-  }
-  return input;
-}
-
-function parseReorderCategoriesBody(value: unknown): { categoryIds: string[] } | null {
-  if (
-    !isRecord(value) ||
-    Object.keys(value).length !== 1 ||
-    Object.keys(value).some((key) => key !== "categoryIds") ||
-    !Array.isArray(value.categoryIds) ||
-    !value.categoryIds.every(isUuid)
-  ) {
-    return null;
-  }
-  return { categoryIds: value.categoryIds };
-}
-
-function parseReorderChannelsBody(value: unknown): { groups: ChannelOrderGroup[] } | null {
-  if (!isRecord(value) || Object.keys(value).length !== 1 || !Object.hasOwn(value, "groups") || !Array.isArray(value.groups)) {
-    return null;
-  }
-
-  const groups: ChannelOrderGroup[] = [];
-  const categoryIds = new Set<string | null>();
-  const channelIds = new Set<string>();
-  for (const entry of value.groups) {
-    if (
-      !isRecord(entry) ||
-      Object.keys(entry).length !== 2 ||
-      !Object.hasOwn(entry, "categoryId") ||
-      !Object.hasOwn(entry, "channelIds") ||
-      (entry.categoryId !== null && !isUuid(entry.categoryId)) ||
-      !Array.isArray(entry.channelIds) ||
-      !entry.channelIds.every(isUuid)
-    ) {
-      return null;
-    }
-
-    const categoryId = entry.categoryId as string | null;
-    if (categoryIds.has(categoryId)) return null;
-    categoryIds.add(categoryId);
-    for (const channelId of entry.channelIds as string[]) {
-      if (channelIds.has(channelId)) return null;
-      channelIds.add(channelId);
-    }
-    groups.push({ categoryId, channelIds: entry.channelIds as string[] });
-  }
-
-  return { groups };
-}
-
-function parseRenameCategoryBody(value: unknown): { name: string } | null {
-  if (!isRecord(value) || !Object.hasOwn(value, "name") || Object.keys(value).some((key) => key !== "name")) return null;
-  const name = parseCategoryName(value.name);
-  return name === null ? null : { name };
-}
-
-function parseOverrides(value: unknown): OverrideInput[] | null {
-  if (!isRecord(value) || Object.keys(value).some((key) => key !== "overrides") || !Object.hasOwn(value, "overrides") || !Array.isArray(value.overrides)) {
-    return null;
-  }
-
-  const overrides: OverrideInput[] = [];
-  for (const candidate of value.overrides) {
-    if (
-      !isRecord(candidate) ||
-      Object.keys(candidate).length !== 4 ||
-      Object.keys(candidate).some((key) => !["subject", "subjectId", "permission", "effect"].includes(key)) ||
-      !Object.hasOwn(candidate, "subjectId") ||
-      !isPermission(candidate.permission) ||
-      (candidate.effect !== "allow" && candidate.effect !== "deny" && candidate.effect !== "unset")
-    ) {
-      return null;
-    }
-    const subject = candidate.subject;
-    if (subject !== "everyone" && subject !== "role" && subject !== "member") return null;
-    const subjectId = candidate.subjectId;
-    if (subject === "everyone" ? subjectId !== null : !isUuid(subjectId)) return null;
-    overrides.push({ subject, subjectId: subject === "everyone" ? null : subjectId as string, permission: candidate.permission, effect: candidate.effect });
   }
   return overrides;
 }
@@ -370,7 +176,7 @@ export class ChannelsService {
   }
 
   async createCategory(principal: AuthPrincipal, body: unknown): Promise<ChannelCategorySummary> {
-    const input = parseCreateCategory(body);
+    const input = parseCategoryNameBody(body);
     if (!input) throw apiError(400, "INVALID_REQUEST", "Проверьте название категории");
     await this.requireChannelManager(principal);
 
@@ -408,7 +214,7 @@ export class ChannelsService {
 
   async renameCategory(principal: AuthPrincipal, categoryId: string, body: unknown): Promise<ChannelCategorySummary> {
     this.assertCategoryId(categoryId);
-    const input = parseRenameCategoryBody(body);
+    const input = parseCategoryNameBody(body);
     if (!input) throw apiError(400, "INVALID_REQUEST", "Проверьте название категории");
     await this.requireChannelManager(principal);
 
@@ -481,133 +287,123 @@ export class ChannelsService {
     const input = parseReorderCategoriesBody(body);
     if (!input) throw apiError(400, "INVALID_REQUEST", "Некорректный порядок категорий");
     await this.requireChannelManager(principal);
-
-    let client: PoolClient | undefined;
-    try {
-      client = await this.pool.connect();
-      await client.query("BEGIN");
-      await client.query("SELECT pg_advisory_xact_lock(21471, 901)");
-      const result = await client.query<{ id: string }>(
-        "SELECT id::text AS id FROM channel_categories ORDER BY position ASC, id ASC FOR UPDATE"
-      );
-      const existingIds = new Set(result.rows.map((row) => row.id));
-      if (
-        input.categoryIds.length === 0 ||
-        new Set(input.categoryIds).size !== input.categoryIds.length ||
-        input.categoryIds.length !== result.rows.length ||
-        input.categoryIds.some((id) => !existingIds.has(id))
-      ) {
-        throw apiError(400, "INVALID_REQUEST", "Некорректный порядок категорий");
-      }
-
-      for (const [index, categoryId] of input.categoryIds.entries()) {
-        await client.query(
-          "UPDATE channel_categories SET position = $1, updated_at = now() WHERE id = $2",
-          [index + 1, categoryId]
-        );
-      }
-      await client.query("COMMIT");
-    } catch (error) {
-      await client?.query("ROLLBACK").catch(() => undefined);
-      auditCategory("audit.category.reorder", principal.userId, null, "failed");
-      throw error;
-    } finally {
-      client?.release();
-    }
-    auditCategory("audit.category.reorder", principal.userId, null, "reordered");
-    await this.notifyAllUsersChannelsChanged(principal.userId, null);
+    await this.reorderWithLock(principal, "category", (client) => this.writeCategoryOrder(client, input.categoryIds));
   }
 
   async reorderChannels(principal: AuthPrincipal, body: unknown): Promise<void> {
     const input = parseReorderChannelsBody(body);
     if (!input) throw apiError(400, "INVALID_REQUEST", "Некорректный порядок каналов");
     await this.requireChannelManager(principal);
+    await this.reorderWithLock(principal, "channel", (client) => this.writeChannelOrder(client, principal, input.groups));
+  }
 
+  private async reorderWithLock(
+    principal: AuthPrincipal,
+    target: "category" | "channel",
+    writeOrder: (client: PoolClient) => Promise<void>
+  ): Promise<void> {
+    const event = `audit.${target}.reorder`;
+    const audit = target === "category" ? auditCategory : auditChannel;
     let client: PoolClient | undefined;
     try {
       client = await this.pool.connect();
       await client.query("BEGIN");
       await client.query("SELECT pg_advisory_xact_lock(21471, 901)");
-
-      const categories = await client.query<{ id: string }>(
-        "SELECT id::text AS id FROM channel_categories ORDER BY position ASC, id ASC FOR UPDATE"
-      );
-      const currentChannels = await client.query<{
-        id: string;
-        category_id: string | null;
-        position: number;
-      }>(
-        `SELECT id::text AS id, category_id::text AS category_id, position
-         FROM channels
-         ORDER BY category_id NULLS FIRST, position ASC, lower(name) ASC, id ASC
-         FOR UPDATE`
-      );
-      const visibleChannels = await this.access.listVisibleChannels(principal, client);
-      const visibleIds = new Set(visibleChannels.map((channel) => channel.id));
-      const submittedIds = new Set(input.groups.flatMap((group) => group.channelIds));
-      const submittedCategoryIds = new Set(input.groups.map((group) => group.categoryId));
-      const existingCategoryIds = new Set(categories.rows.map((category) => category.id));
-
-      if (
-        input.groups.length !== categories.rows.length + 1 ||
-        submittedCategoryIds.size !== input.groups.length ||
-        !submittedCategoryIds.has(null) ||
-        [...existingCategoryIds].some((categoryId) => !submittedCategoryIds.has(categoryId)) ||
-        submittedCategoryIds.size !== existingCategoryIds.size + 1 ||
-        submittedIds.size !== visibleIds.size ||
-        [...visibleIds].some((channelId) => !submittedIds.has(channelId))
-      ) {
-        throw apiError(400, "INVALID_REQUEST", "Некорректный порядок каналов");
-      }
-
-      const hiddenByCategory = new Map<string | null, string[]>();
-      for (const channel of currentChannels.rows) {
-        if (visibleIds.has(channel.id)) continue;
-        const hidden = hiddenByCategory.get(channel.category_id) ?? [];
-        hidden.push(channel.id);
-        hiddenByCategory.set(channel.category_id, hidden);
-      }
-
-      // Keep hidden channels out of the client contract; retain their category and relative order server-side.
-      const completeGroups = input.groups.map((group) => ({
-        categoryId: group.categoryId,
-        channelIds: [...group.channelIds, ...(hiddenByCategory.get(group.categoryId) ?? [])]
-      }));
-
-      for (const group of completeGroups) {
-        for (const [index, channelId] of group.channelIds.entries()) {
-          await client.query(
-            "UPDATE channels SET category_id = $3, position = $1, updated_at = now() WHERE id = $2",
-            [index + 1, channelId, group.categoryId]
-          );
-        }
-      }
-
-      for (const { categoryId } of completeGroups) {
-        await client.query(
-          `WITH ordered AS (
-            SELECT id, row_number() OVER (ORDER BY position ASC, lower(name) ASC, id ASC)::integer AS new_position
-            FROM channels
-            WHERE category_id IS NOT DISTINCT FROM $1
-          )
-          UPDATE channels AS channel
-          SET position = ordered.new_position, updated_at = now()
-          FROM ordered
-          WHERE ordered.id = channel.id`,
-          [categoryId]
-        );
-      }
-
+      await writeOrder(client);
       await client.query("COMMIT");
     } catch (error) {
       await client?.query("ROLLBACK").catch(() => undefined);
-      auditChannel("audit.channel.reorder", principal.userId, null, "failed");
+      audit(event, principal.userId, null, "failed");
       throw error;
     } finally {
       client?.release();
     }
-    auditChannel("audit.channel.reorder", principal.userId, null, "reordered");
+    audit(event, principal.userId, null, "reordered");
     await this.notifyAllUsersChannelsChanged(principal.userId, null);
+  }
+
+  private async lockedCategoryIds(client: PoolClient): Promise<Set<string>> {
+    const { rows } = await client.query<{ id: string }>(
+      "SELECT id::text AS id FROM channel_categories ORDER BY position ASC, id ASC FOR UPDATE"
+    );
+    return new Set(rows.map((row) => row.id));
+  }
+
+  private async writeCategoryOrder(client: PoolClient, categoryIds: string[]): Promise<void> {
+    const existingIds = await this.lockedCategoryIds(client);
+    const submittedIds = new Set(categoryIds);
+    if (submittedIds.size === 0 || submittedIds.size !== categoryIds.length || !matchesIds(submittedIds, existingIds)) {
+      throw apiError(400, "INVALID_REQUEST", "Некорректный порядок категорий");
+    }
+
+    for (const [index, categoryId] of categoryIds.entries()) {
+      await client.query(
+        "UPDATE channel_categories SET position = $1, updated_at = now() WHERE id = $2",
+        [index + 1, categoryId]
+      );
+    }
+  }
+
+  private async writeChannelOrder(client: PoolClient, principal: AuthPrincipal, groups: ChannelOrderGroup[]): Promise<void> {
+    const existingCategoryIds = await this.lockedCategoryIds(client);
+    const currentChannels = await client.query<{
+      id: string;
+      category_id: string | null;
+      position: number;
+    }>(
+      `SELECT id::text AS id, category_id::text AS category_id, position
+       FROM channels
+       ORDER BY category_id NULLS FIRST, position ASC, lower(name) ASC, id ASC
+       FOR UPDATE`
+    );
+    const visibleChannels = await this.access.listVisibleChannels(principal, client);
+    const visibleIds = new Set(visibleChannels.map((channel) => channel.id));
+    const submittedIds = new Set(groups.flatMap((group) => group.channelIds));
+    const submittedCategoryIds = new Set(groups.map((group) => group.categoryId));
+    const expectedCategoryIds = new Set([null, ...existingCategoryIds]);
+    if (submittedCategoryIds.size !== groups.length ||
+      !matchesIds(submittedCategoryIds, expectedCategoryIds) ||
+      !matchesIds(submittedIds, visibleIds)) {
+      throw apiError(400, "INVALID_REQUEST", "Некорректный порядок каналов");
+    }
+
+    const hiddenByCategory = new Map<string | null, string[]>();
+    for (const channel of currentChannels.rows) {
+      if (visibleIds.has(channel.id)) continue;
+      const hidden = hiddenByCategory.get(channel.category_id) ?? [];
+      hidden.push(channel.id);
+      hiddenByCategory.set(channel.category_id, hidden);
+    }
+
+    // Keep hidden channels out of the client contract; retain their category and relative order server-side.
+    const completeGroups = groups.map((group) => ({
+      categoryId: group.categoryId,
+      channelIds: [...group.channelIds, ...(hiddenByCategory.get(group.categoryId) ?? [])]
+    }));
+
+    for (const group of completeGroups) {
+      for (const [index, channelId] of group.channelIds.entries()) {
+        await client.query(
+          "UPDATE channels SET category_id = $3, position = $1, updated_at = now() WHERE id = $2",
+          [index + 1, channelId, group.categoryId]
+        );
+      }
+    }
+
+    for (const { categoryId } of completeGroups) {
+      await client.query(
+        `WITH ordered AS (
+          SELECT id, row_number() OVER (ORDER BY position ASC, lower(name) ASC, id ASC)::integer AS new_position
+          FROM channels
+          WHERE category_id IS NOT DISTINCT FROM $1
+        )
+        UPDATE channels AS channel
+        SET position = ordered.new_position, updated_at = now()
+        FROM ordered
+        WHERE ordered.id = channel.id`,
+        [categoryId]
+      );
+    }
   }
 
   async listSubjects(principal: AuthPrincipal): Promise<{
@@ -827,7 +623,7 @@ export class ChannelsService {
 
   async setOverrides(principal: AuthPrincipal, channelId: string, body: unknown): Promise<void> {
     this.assertChannelId(channelId);
-    const overrides = parseOverrides(body);
+    const overrides = parseChannelOverridesBody(body);
     if (!overrides) throw apiError(400, "INVALID_REQUEST", "Проверьте переопределения канала");
     if (overrides.some((override) => override.permission === "ADMINISTRATOR")) {
       throw apiError(403, "FORBIDDEN", "ADMINISTRATOR нельзя задавать для канала");
