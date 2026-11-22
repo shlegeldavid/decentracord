@@ -572,7 +572,22 @@ if (!inContainer) {
     expect(uncategorizedAfterMove.rows.map((row) => row.position)).toEqual(uncategorizedAfterMove.rows.map((_, index) => index + 1));
 
     await expectError(await request(managerSession, `/api/channels/${moving.id}`, "PATCH", { categoryId: "not-a-uuid" }), 400, "INVALID_REQUEST");
-    await expectError(await request(managerSession, `/api/channels/${moving.id}`, "PATCH", { categoryId: "00000000-0000-4000-8000-000000000000" }), 404, "CATEGORY_NOT_FOUND");
+    const missingCategoryId = "00000000-0000-4000-8000-000000000000";
+    await expectError(await request(managerSession, `/api/channels/${moving.id}`, "PATCH", {
+      name: `Uncommitted name ${suffix}`,
+      description: "Uncommitted description",
+      categoryId: missingCategoryId
+    }), 404, "CATEGORY_NOT_FOUND");
+    const afterFailedMove = await pool.query<{ name: string; description: string | null; category_id: string | null; position: number }>(
+      "SELECT name, description, category_id, position FROM channels WHERE id = $1",
+      [moving.id]
+    );
+    expect(afterFailedMove.rows).toEqual([{
+      name: moving.name, description: null, category_id: null, position: uncategorizedAfterMove.rows.length
+    }]);
+    await expectError(await request(managerSession, `/api/channels/${moving.id}`, "PATCH", {
+      name: targetExisting.name, categoryId: missingCategoryId
+    }), 409, "CHANNEL_ALREADY_EXISTS");
     await expectError(await request(managerSession, `/api/channels/${randomUUID()}`, "PATCH", { categoryId: target.id }), 404, "CHANNEL_NOT_FOUND");
     await expectError(await request(viewerSession, `/api/channels/${moving.id}`, "PATCH", { categoryId: target.id }), 403, "FORBIDDEN");
     await expectError(await request(managerSession, `/api/channels/${moving.id}`, "PATCH", { name: "Allowed name", extra: true }), 400, "INVALID_REQUEST");
