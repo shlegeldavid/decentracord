@@ -1288,6 +1288,28 @@ export function App() {
       setHasMoreHistory(false);
       setHistoryLoadState("ready");
     };
+    const clearUnavailableChannels = (items: Channel[]) => {
+      const readableChannelIds = new Set(items.filter((channel) => channel.canView).map((channel) => channel.id));
+      for (const channel of channelsRef.current) {
+        if (readableChannelIds.has(channel.id)) continue;
+        if (channel.canView) {
+          const scopeKey = `${CHANNEL_SCOPE_PREFIX}${channel.id}` as const;
+          const generation = catchUpChannelGenerationRef.current.get(scopeKey) ?? 0;
+          catchUpChannelGenerationRef.current.set(scopeKey, generation + 1);
+          catchUpInFlightRef.current.delete(scopeKey);
+          messageCursorsRef.current.delete(scopeKey);
+          observedMessageCursorsRef.current.delete(scopeKey);
+          maxAppliedSeqRef.current.delete(scopeKey);
+          catchUpRequestedRef.current.delete(scopeKey);
+        }
+        channelSubscriptions.current.confirmed.delete(channel.id);
+        channelSubscriptions.current.pending.delete(channel.id);
+      }
+      updatePendingMessages((current) => current.filter((message) => {
+        const pendingChannelId = channelIdFromScope(message.scopeKey);
+        return pendingChannelId === null || readableChannelIds.has(pendingChannelId);
+      }));
+    };
     const refreshChannels = () => {
       void getChannels().then(({ channels: items, categories: categoryItems }) => {
         if (!active) return;
@@ -1308,27 +1330,7 @@ export function App() {
               : "Доступ к каналу отозван");
           }
         }
-        const readableChannelIds = new Set(items.filter((channel) => channel.canView).map((channel) => channel.id));
-        for (const channel of channelsRef.current) {
-          if (readableChannelIds.has(channel.id)) continue;
-          if (channel.canView) {
-            catchUpChannelGenerationRef.current.set(
-              `${CHANNEL_SCOPE_PREFIX}${channel.id}`,
-              (catchUpChannelGenerationRef.current.get(`${CHANNEL_SCOPE_PREFIX}${channel.id}`) ?? 0) + 1
-            );
-            catchUpInFlightRef.current.delete(`${CHANNEL_SCOPE_PREFIX}${channel.id}`);
-            messageCursorsRef.current.delete(`${CHANNEL_SCOPE_PREFIX}${channel.id}`);
-            observedMessageCursorsRef.current.delete(`${CHANNEL_SCOPE_PREFIX}${channel.id}`);
-            maxAppliedSeqRef.current.delete(`${CHANNEL_SCOPE_PREFIX}${channel.id}`);
-            catchUpRequestedRef.current.delete(`${CHANNEL_SCOPE_PREFIX}${channel.id}`);
-          }
-          channelSubscriptions.current.confirmed.delete(channel.id);
-          channelSubscriptions.current.pending.delete(channel.id);
-        }
-        updatePendingMessages((current) => current.filter((message) => {
-        const pendingChannelId = channelIdFromScope(message.scopeKey);
-        return pendingChannelId === null || readableChannelIds.has(pendingChannelId);
-      }));
+        clearUnavailableChannels(items);
         channelsRef.current = items;
         replaceUnreadCounts(items, false);
         setChannels(items);
@@ -1412,27 +1414,7 @@ export function App() {
         refreshChannels();
         return;
       }
-      const readableChannelIds = new Set(value.channels.filter((channel) => channel.canView).map((channel) => channel.id));
-      for (const channel of channelsRef.current) {
-        if (readableChannelIds.has(channel.id)) continue;
-        if (channel.canView) {
-          catchUpChannelGenerationRef.current.set(
-            `${CHANNEL_SCOPE_PREFIX}${channel.id}`,
-            (catchUpChannelGenerationRef.current.get(`${CHANNEL_SCOPE_PREFIX}${channel.id}`) ?? 0) + 1
-          );
-          catchUpInFlightRef.current.delete(`${CHANNEL_SCOPE_PREFIX}${channel.id}`);
-          messageCursorsRef.current.delete(`${CHANNEL_SCOPE_PREFIX}${channel.id}`);
-          observedMessageCursorsRef.current.delete(`${CHANNEL_SCOPE_PREFIX}${channel.id}`);
-          maxAppliedSeqRef.current.delete(`${CHANNEL_SCOPE_PREFIX}${channel.id}`);
-          catchUpRequestedRef.current.delete(`${CHANNEL_SCOPE_PREFIX}${channel.id}`);
-        }
-        channelSubscriptions.current.confirmed.delete(channel.id);
-        channelSubscriptions.current.pending.delete(channel.id);
-      }
-      updatePendingMessages((current) => current.filter((message) => {
-        const pendingChannelId = channelIdFromScope(message.scopeKey);
-        return pendingChannelId === null || readableChannelIds.has(pendingChannelId);
-      }));
+      clearUnavailableChannels(value.channels);
       const selectedId = selectedChannelIdRef.current;
       if (selectedId) {
         const currentSelected = value.channels.find((channel) => channel.id === selectedId);
