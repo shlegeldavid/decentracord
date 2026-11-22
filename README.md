@@ -1,5 +1,7 @@
 # Decentracord
 
+[![Поддерживаемость кода Qlty](https://qlty.sh/badges/1c125ee6-6820-4bc0-98ae-4c0196520b15/maintainability.svg)](https://qlty.sh/gh/shlegeldavid/projects/decentracord)
+
 Decentracord — браузерный мессенджер для команды на собственном сервере. Общайтесь в каналах и личных переписках, разделяйте доступ по ролям и управляйте учётными записями в одном интерфейсе.
 
 ![Общий канал в тёмной теме со списком участников по ролям](docs/screenshots/workspace.webp)
