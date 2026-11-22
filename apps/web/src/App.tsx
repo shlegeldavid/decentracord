@@ -17,8 +17,6 @@ import {
   getMessages,
   getOrganization,
   getPinnedMessages,
-  isChannel,
-  isChannelCategory,
   listConversations,
   markConversationRead,
   logout,
@@ -57,8 +55,9 @@ import { LoginScreen } from "./components/LoginScreen";
 import { SettingsModal, type SettingsSection } from "./components/SettingsModal";
 import { useTheme } from "./hooks/useTheme";
 import { useTimezone } from "./hooks/useTimezone";
-import { CHANNEL_REALTIME, CONVERSATION_REALTIME, connectRealtime, type RealtimeStatus } from "./realtime";
+import { CONVERSATION_REALTIME, connectRealtime, type RealtimeStatus } from "./realtime";
 import { bindChannelMessageEvents, bindConversationMessageEvents } from "./realtimeMessageEvents";
+import { bindChannelEvents, bindSessionEvents, subscribeToReadableChannels, type ChannelSubscriptions } from "./realtimeWorkspaceEvents";
 
 type ScreenState = "loading" | "guest" | "authenticated";
 type WorkspaceOverlay = "channels" | "members" | null;
@@ -148,10 +147,6 @@ function rejectedSendReason(error: unknown): string {
   return error.message || "Отправка отклонена.";
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 const CHANNEL_SCOPE_PREFIX = "channel:";
 const CONVERSATION_SCOPE_PREFIX = "conversation:";
 
@@ -187,16 +182,6 @@ function scopeKeyOf(message: MessageView): ScopeKey {
 
 function channelIdFromScope(scopeKey: string): string | null {
   return scopeKey.startsWith(CHANNEL_SCOPE_PREFIX) ? scopeKey.slice(CHANNEL_SCOPE_PREFIX.length) : null;
-}
-
-function isChannelsSync(value: unknown): value is { channels: Channel[]; categories: ChannelCategory[] } {
-  return isRecord(value) && Array.isArray(value.channels) && value.channels.every(isChannel) &&
-    Array.isArray(value.categories) && value.categories.every(isChannelCategory);
-}
-
-function channelIdFromEvent(value: unknown): string | null {
-  if (!isRecord(value) || typeof value.channelId !== "string" || value.channelId.length === 0) return null;
-  return value.channelId;
 }
 
 function createClientRequestId(): string {
@@ -302,7 +287,7 @@ export function App() {
   // переписку: не чаще одного запроса в 2 секунды на строку.
   const conversationRefreshAtRef = useRef(new Map<string, number>());
   const deletedMessageIdsRef = useRef<Set<string>>(new Set());
-  const channelSubscriptions = useRef({ confirmed: new Set<string>(), pending: new Set<string>() });
+  const channelSubscriptions = useRef<ChannelSubscriptions>(new Map());
   // Состояние набора живёт только здесь: карта «переписка → кто печатает»
   // с временем истечения и карта времени последней отправки на переписку.
   const typingRef = useRef(new Map<string, Map<string, { login: string; expiresAt: number }>>());
@@ -469,14 +454,7 @@ export function App() {
   }, [observeMessageCursor, updatePendingMessages]);
 
   const subscribeToChannels = useCallback((items: Channel[]) => {
-    const socket = realtimeSocket.current;
-    if (!socket?.connected) return;
-    for (const channel of items) {
-      if (!channel.canView) continue;
-      if (channelSubscriptions.current.confirmed.has(channel.id) || channelSubscriptions.current.pending.has(channel.id)) continue;
-      channelSubscriptions.current.pending.add(channel.id);
-      socket.emit(CHANNEL_REALTIME.subscribe, { channelId: channel.id });
-    }
+    subscribeToReadableChannels(realtimeSocket.current, channelSubscriptions.current, items);
   }, []);
 
   useEffect(() => {
@@ -623,8 +601,7 @@ export function App() {
     setMessageInput("");
     setMessageError(null);
     deletedMessageIdsRef.current = new Set();
-    channelSubscriptions.current.confirmed.clear();
-    channelSubscriptions.current.pending.clear();
+    channelSubscriptions.current.clear();
     typingRef.current.clear();
     typingSentAtRef.current.clear();
     setTypingVersion((value) => value + 1);
@@ -1046,8 +1023,9 @@ export function App() {
     realtimeSocket.current = socket;
     setRealtimeStatus("connecting");
 
+    const isCurrentConnection = () => active && realtimeSocket.current === socket;
     const invalidate = () => {
-      if (!active) return;
+      if (!isCurrentConnection()) return;
       active = false;
       clearPrivateSession();
     };
@@ -1084,8 +1062,7 @@ export function App() {
           maxAppliedSeqRef.current.delete(scopeKey);
           catchUpRequestedRef.current.delete(scopeKey);
         }
-        channelSubscriptions.current.confirmed.delete(channel.id);
-        channelSubscriptions.current.pending.delete(channel.id);
+        channelSubscriptions.current.delete(channel.id);
       }
       updatePendingMessages((current) => current.filter((message) => {
         const pendingChannelId = channelIdFromScope(message.scopeKey);
@@ -1116,10 +1093,6 @@ export function App() {
       setChannels(items);
       setCategories(categories);
     };
-    const clearChannelSubscriptions = () => {
-      channelSubscriptions.current.confirmed.clear();
-      channelSubscriptions.current.pending.clear();
-    };
     const queueSendingMessages = () => {
       updatePendingMessages((current) => current.map((message) =>
         message.state === "sending" ? { ...message, state: "queued" } : message
@@ -1127,12 +1100,12 @@ export function App() {
     };
     const refreshChannels = () => {
       void getChannels().then(({ channels: items, categories: categoryItems }) => {
-        if (!active) return;
+        if (!isCurrentConnection()) return;
         syncSelectedChannel(items, false);
         clearUnavailableChannels(items);
         applyChannelList(items, categoryItems, false);
       }).catch((error: unknown) => {
-        if (!active) return;
+        if (!isCurrentConnection()) return;
         if (error instanceof ApiError && error.status === 401) {
           invalidate();
           return;
@@ -1141,117 +1114,71 @@ export function App() {
       });
     };
 
-    socket.on("session:ready", () => {
+    const findChannel = (id: string) => channelsRef.current.find((channel) => channel.id === id);
+    bindChannelEvents(socket, channelSubscriptions.current, {
+      findChannel,
+      refresh: refreshChannels,
+      applySync: (items, categoryItems) => {
+        clearUnavailableChannels(items);
+        syncSelectedChannel(items, true);
+        applyChannelList(items, categoryItems, true);
+      },
+      revoke: (id, reason) => {
+        if (selectedChannelIdRef.current === id) markSelectedChannelRevoked(id, reason);
+      }
+    });
+
+    async function recoverOpenScope(kind: MessageScope, id: string): Promise<boolean> {
+      try {
+        await catchUp(kind, id);
+      } catch (error) {
+        if (!isCurrentConnection()) return false;
+        const status = error instanceof ApiError ? error.status : null;
+        if (status === 401) {
+          invalidate();
+          return false;
+        }
+        if (kind === "channel" && (status === 403 || status === 404)) {
+          const scopeKey = `${CHANNEL_SCOPE_PREFIX}${id}`;
+          const reason = rejectedSendReason(error);
+          updatePendingMessages((current) => current.map((message) =>
+            message.scopeKey === scopeKey && (message.state === "queued" || message.state === "sending")
+              ? { ...message, state: "rejected", reason }
+              : message));
+          refreshChannels();
+        } else {
+          const selectedId = kind === "channel" ? selectedChannelIdRef : selectedConversationIdRef;
+          if (selectedId.current === id) setMessageError("Не удалось обновить переписку");
+        }
+      }
+      return isCurrentConnection();
+    }
+
+    async function recoverAfterReconnect(): Promise<void> {
       setRealtimeStatus("connected");
       subscribeToChannels(channelsRef.current);
       const channelId = selectedChannelIdRef.current;
       const conversationId = selectedConversationIdRef.current;
-      void (async () => {
-        if (channelId) {
-          try {
-            await catchUpChannel(channelId);
-          } catch (error) {
-            if (error instanceof ApiError && error.status === 401) {
-              invalidate();
-              return;
-            }
-            if (error instanceof ApiError && (error.status === 403 || error.status === 404)) {
-              const reason = rejectedSendReason(error);
-              updatePendingMessages((current) => current.map((message) =>
-                message.scopeKey === `${CHANNEL_SCOPE_PREFIX}${channelId}` &&
-                (message.state === "queued" || message.state === "sending")
-                  ? { ...message, state: "rejected", reason }
-                  : message));
-              refreshChannels();
-            } else {
-              if (selectedChannelIdRef.current === channelId) setMessageError("Не удалось обновить переписку");
-            }
-          }
-        }
+      if (channelId && !await recoverOpenScope("channel", channelId)) return;
+      if (conversationId && !await recoverOpenScope("conversation", conversationId)) return;
+      void refreshConversations();
 
-        // Открытая переписка догоняется по `updated_seq`; остальные строки раздела
-        // обновляются одним запросом за reconnect.
-        if (conversationId) {
-          try {
-            await catchUpConversation(conversationId);
-          } catch (error) {
-            if (error instanceof ApiError && error.status === 401) {
-              invalidate();
-              return;
-            }
-            if (selectedConversationIdRef.current === conversationId) setMessageError("Не удалось обновить переписку");
-          }
-        }
-        void refreshConversations();
+      if (!csrfToken || !socket.connected) return;
+      const readableChannelIds = new Set(channelsRef.current.filter((channel) => channel.canView).map((channel) => channel.id));
+      const queuedMessages = pendingMessagesRef.current.flatMap((message) => {
+        if (message.state !== "queued") return [];
+        const queuedChannelId = channelIdFromScope(message.scopeKey);
+        return queuedChannelId !== null && readableChannelIds.has(queuedChannelId)
+          ? [{ message, channelId: queuedChannelId }]
+          : [];
+      });
+      for (const { message, channelId: queuedChannelId } of queuedMessages) {
+        if (!isCurrentConnection() || !socket.connected) break;
+        if (!pendingMessagesRef.current.some((pending) => pending.clientRequestId === message.clientRequestId)) continue;
+        await submitScopedMessage("channel", queuedChannelId, message.content, message.clientRequestId, csrfToken);
+      }
+    }
 
-        if (!csrfToken || !realtimeSocket.current?.connected) return;
-        const readableChannelIds = new Set(channelsRef.current.filter((channel) => channel.canView).map((channel) => channel.id));
-        const queuedMessages = pendingMessagesRef.current.filter((message) => {
-          if (message.state !== "queued") return false;
-          const queuedChannelId = channelIdFromScope(message.scopeKey);
-          return queuedChannelId !== null && readableChannelIds.has(queuedChannelId);
-        });
-        for (const message of queuedMessages) {
-          if (!pendingMessagesRef.current.some((pending) => pending.clientRequestId === message.clientRequestId)) continue;
-          const queuedChannelId = channelIdFromScope(message.scopeKey);
-          if (queuedChannelId === null) continue;
-          await submitScopedMessage("channel", queuedChannelId, message.content, message.clientRequestId, csrfToken);
-          if (!realtimeSocket.current?.connected) break;
-        }
-      })();
-    });
-    socket.on("session:revoked", (value: unknown) => {
-      if (typeof value === "object" && value !== null && "code" in value && value.code === "SESSION_REVOKED") invalidate();
-    });
-    socket.on(CHANNEL_REALTIME.sync, (value: unknown) => {
-      clearChannelSubscriptions();
-      if (!isChannelsSync(value)) {
-        refreshChannels();
-        return;
-      }
-      clearUnavailableChannels(value.channels);
-      syncSelectedChannel(value.channels, true);
-      applyChannelList(value.channels, value.categories, true);
-    });
-    socket.on(CHANNEL_REALTIME.updated, (value: unknown) => {
-      const channelId = channelIdFromEvent(value);
-      if (!channelId) {
-        refreshChannels();
-        return;
-      }
-      if (channelsRef.current.some((channel) => channel.id === channelId)) refreshChannels();
-    });
-    socket.on(CHANNEL_REALTIME.revoked, (value: unknown) => {
-      if (!isRecord(value) || typeof value.channelId !== "string" || value.channelId.length === 0 ||
-        ("reason" in value && typeof value.reason !== "string")) {
-        refreshChannels();
-        return;
-      }
-      const channelId = value.channelId;
-      if (selectedChannelIdRef.current !== channelId) return;
-      const reason = typeof value.reason === "string" && value.reason.trim().length > 0
-        ? value.reason
-        : "Доступ к каналу отозван";
-      markSelectedChannelRevoked(channelId, reason);
-    });
-    socket.on(CHANNEL_REALTIME.subscribed, (value: unknown) => {
-      const channelId = channelIdFromEvent(value);
-      if (!channelId) return;
-      channelSubscriptions.current.pending.delete(channelId);
-      if (channelsRef.current.some((channel) => channel.id === channelId && channel.canView)) {
-        channelSubscriptions.current.confirmed.add(channelId);
-      }
-    });
-    socket.on(CHANNEL_REALTIME.subscribeError, (value: unknown) => {
-      const channelId = channelIdFromEvent(value);
-      if (!channelId) {
-        clearChannelSubscriptions();
-      } else {
-        channelSubscriptions.current.pending.delete(channelId);
-        channelSubscriptions.current.confirmed.delete(channelId);
-      }
-      refreshChannels();
-    });
     const removeRealtimeMessage = (scopeKey: ScopeKey, messageId: string, updatedSeq: number) => {
       deletedMessageIdsRef.current.add(messageId);
       observeMessageCursor(scopeKey, updatedSeq);
@@ -1294,7 +1221,7 @@ export function App() {
     };
 
     bindChannelMessageEvents(socket, user.id, {
-      canView: (channelId) => channelsRef.current.some((channel) => channel.id === channelId && channel.canView),
+      canView: (channelId) => findChannel(channelId)?.canView === true,
       isSelected: (channelId) => selectedChannelIdRef.current === channelId,
       apply: applyMessage,
       remove: ({ scopeId, messageId, updatedSeq }) =>
@@ -1320,21 +1247,18 @@ export function App() {
         setTypingVersion((current) => current + 1);
       }
     });
-    socket.on("connect_error", (error) => {
-      setRealtimeStatus("disconnected");
-      queueSendingMessages();
-      if (error.message === "UNAUTHORIZED") invalidate();
-    });
-    socket.on("disconnect", (reason) => {
-      setRealtimeStatus("disconnected");
-      clearChannelSubscriptions();
-      // при разрыве связи индикатор пропадает сразу — состояние набора
-      // восстановить нельзя, событий про «кто печатал» на сервере нет.
-      typingRef.current.clear();
-      typingSentAtRef.current.clear();
-      setTypingVersion((current) => current + 1);
-      queueSendingMessages();
-      if (reason === "io server disconnect") invalidate();
+    bindSessionEvents(socket, {
+      ready: () => void recoverAfterReconnect(),
+      setStatus: setRealtimeStatus,
+      clearConnection: () => {
+        channelSubscriptions.current.clear();
+        // События набора не догоняются после переподключения.
+        typingRef.current.clear();
+        typingSentAtRef.current.clear();
+        setTypingVersion((current) => current + 1);
+      },
+      requeueSending: queueSendingMessages,
+      invalidate
     });
     socket.connect();
 
@@ -1342,9 +1266,12 @@ export function App() {
       active = false;
       socket.removeAllListeners();
       socket.disconnect();
-      if (realtimeSocket.current === socket) realtimeSocket.current = null;
+      if (realtimeSocket.current === socket) {
+        channelSubscriptions.current.clear();
+        realtimeSocket.current = null;
+      }
     };
-  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUpChannel, catchUpConversation, refreshConversations, csrfToken, replaceUnreadCounts, setChannelUnreadCount, submitScopedMessage, updatePendingMessages, markReadThroughAppliedMessages, markConversationReadThroughApplied, applyConversations, observeMessageCursor]);
+  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUp, refreshConversations, csrfToken, replaceUnreadCounts, setChannelUnreadCount, submitScopedMessage, updatePendingMessages, markReadThroughAppliedMessages, markConversationReadThroughApplied, applyConversations, observeMessageCursor]);
 
   useEffect(() => {
     const channelId = selectedChannelId;
