@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { applicationOrigin, expect, test } from "./fixtures.js";
 import type { APIRequestContext, Browser, BrowserContext, Page } from "@playwright/test";
 
@@ -339,6 +339,61 @@ test.describe("personal messages in the sidebar", () => {
       }
     } finally {
       await author.context.close();
+    }
+  });
+
+  test("keeps the open conversation when a channel history response arrives late", async ({ browser, identity, messagingSeed }) => {
+    const admin = await newAuthenticatedPage(browser, identity.admin);
+    const lateContent = `История канала ${randomBytes(4).toString("hex")}`;
+    const dmContent = `Личное сообщение ${randomBytes(4).toString("hex")}`;
+    const heldHistory = Promise.withResolvers<void>();
+    let member: Awaited<ReturnType<typeof newAuthenticatedPage>> | undefined;
+    try {
+      const channel = await createSendableChannelViaApi(admin.context, `e2e-switch-${randomBytes(4).toString("hex")}`);
+      const csrfToken = await issueCsrf(admin.context.request);
+      const sent = await admin.context.request.post(`/api/channels/${channel.id}/messages`, {
+        data: { content: lateContent, clientRequestId: randomUUID() },
+        headers: { origin: applicationOrigin, "x-csrf-token": csrfToken }
+      });
+      expect(sent.status(), await sent.text()).toBe(201);
+      member = await newAuthenticatedPage(browser, messagingSeed.member);
+      const peerLogin = messagingSeed.manager.login;
+      await startConversationWith(member.page, peerLogin);
+      await sendMessage(member.page, dmContent);
+      await expect(messageRow(member.page, dmContent)).toHaveAttribute("data-message-id", /.+/u);
+
+      const matchesHistory = (url: URL) =>
+        url.pathname === `/api/channels/${channel.id}/messages` && !url.searchParams.has("before") && !url.searchParams.has("after");
+      const fetchedHistory = Promise.withResolvers<void>();
+      await member.page.route(matchesHistory, async (route) => {
+        const response = await route.fetch();
+        const history = await response.json() as { messages: Array<{ content: string }> };
+        expect(response.status()).toBe(200);
+        expect(history.messages).toEqual(expect.arrayContaining([expect.objectContaining({ content: lateContent })]));
+        fetchedHistory.resolve();
+        await heldHistory.promise;
+        await route.fulfill({ response });
+      }, { times: 1 });
+      await member.page.locator(`[data-channel-id="${channel.id}"] .channel-list-select`).click();
+      await expect(member.page.getByRole("heading", { level: 2, name: channel.name })).toBeVisible();
+      await fetchedHistory.promise;
+
+      const conversation = member.page.locator(".dm-section .dm-row").filter({ hasText: peerLogin });
+      await conversation.locator(".dm-row-select").click();
+      await expect(messageRow(member.page, dmContent)).toBeVisible();
+      const deliveredHistory = member.page.waitForResponse((response) => matchesHistory(new URL(response.url())));
+      heldHistory.resolve();
+      expect(await (await deliveredHistory).finished()).toBeNull();
+      await member.page.evaluate(() => new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      }));
+      await expect(member.page.locator(".chat-pane-header h2")).toHaveText(peerLogin);
+      await expect(messageRow(member.page, dmContent)).toBeVisible();
+      await expect(messageRow(member.page, lateContent)).toHaveCount(0);
+    } finally {
+      heldHistory.resolve();
+      await member?.context.close();
+      await admin.context.close();
     }
   });
 

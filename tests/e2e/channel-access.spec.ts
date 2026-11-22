@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { io, type Socket } from "socket.io-client";
 import {
   createFixtureUser,
@@ -457,10 +458,18 @@ test.describe("channel visibility and delegated access", () => {
     const adminContext = page.context();
     const adminCsrf = await issueCsrf(adminContext);
     const viewerRole = await createRole(adminContext, adminCsrf, `e2e-live-viewer-${suffix}`, ["VIEW_CHANNEL"]);
-    const channel = await createChannel(adminContext, adminCsrf, `e2e-live-channel-${suffix}`);
+    const channelName = `e2e-live-channel-${suffix}`;
+    const channel = await createChannel(adminContext, adminCsrf, channelName);
     const member = await createMember(adminContext, adminCsrf, memberCredentials.login, memberCredentials.password);
+    const content = "Сообщение из закрытого канала";
+    const sent = await adminContext.request.post(`${applicationOrigin}/api/channels/${channel.id}/messages`, {
+      data: { content, clientRequestId: randomUUID() },
+      headers: writeHeaders(adminCsrf)
+    });
+    expect(sent.status(), await sent.text()).toBe(201);
     let memberSession: AuthenticatedSession | undefined;
     let socket: Socket | undefined;
+    const heldHistory = Promise.withResolvers<void>();
 
     try {
       memberSession = await newAuthenticatedPage(browser, memberCredentials);
@@ -487,6 +496,24 @@ test.describe("channel visibility and delegated access", () => {
         payload: { channelId: channel.id }
       });
 
+      const historyPath = `/api/channels/${channel.id}/messages`;
+      const matchesHistory = (url: URL) =>
+        url.pathname === historyPath && !url.searchParams.has("before") && !url.searchParams.has("after");
+      const fetchedHistory = Promise.withResolvers<void>();
+      await memberSession.page.route(matchesHistory, async (route) => {
+        const response = await route.fetch();
+        const history = await response.json() as { messages: Array<{ content: string }> };
+        expect(response.status()).toBe(200);
+        expect(history.messages).toEqual(expect.arrayContaining([expect.objectContaining({ content })]));
+        fetchedHistory.resolve();
+        await heldHistory.promise;
+        await route.fulfill({ response });
+      }, { times: 1 });
+      await memberChannel.locator(".channel-list-select").click();
+      const heading = memberSession.page.getByRole("heading", { level: 2, name: channelName });
+      await expect(heading).toBeVisible();
+      await fetchedHistory.promise;
+
       const permissionRevokeSync = waitForSocketEvent(socket, "channels:sync");
       const permissionRevoked = waitForSocketEventMatching(
         socket,
@@ -503,6 +530,17 @@ test.describe("channel visibility and delegated access", () => {
       expect(hiddenChannels?.some((visible) => visible.id === channel.id)).toBe(false);
       expect(await permissionRevoked).toMatchObject({ channelId: channel.id });
       await expect(memberChannel).toHaveCount(0);
+      const revoked = memberSession.page.getByRole("heading", { name: "Доступ к каналу отозван" });
+      await expect(revoked).toBeVisible();
+      const deliveredHistory = memberSession.page.waitForResponse((response) => matchesHistory(new URL(response.url())));
+      heldHistory.resolve();
+      expect(await (await deliveredHistory).finished()).toBeNull();
+      await memberSession.page.evaluate(() => new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+      }));
+      await expect(heading).toBeVisible();
+      await expect(revoked).toBeVisible();
+      await expect(memberSession.page.getByText(content, { exact: true })).toHaveCount(0);
       expect(await subscribeToChannel(socket, channel.id)).toEqual({
         event: "channel:subscribe:error",
         payload: { channelId: channel.id, code: "CHANNEL_NOT_FOUND" }
@@ -561,6 +599,7 @@ test.describe("channel visibility and delegated access", () => {
         payload: { channelId: channel.id }
       });
     } finally {
+      heldHistory.resolve();
       socket?.disconnect();
       await memberSession?.context.close();
     }
