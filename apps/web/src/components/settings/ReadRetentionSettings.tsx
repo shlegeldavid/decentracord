@@ -95,6 +95,7 @@ export function ReadRetentionSettings({ csrfToken, onSessionExpired }: ReadReten
           <div className="read-retention-option">
             <input
               checked={keepForever}
+              disabled={isLoading}
               id="read-retention-forever"
               name="read-retention-mode"
               onChange={() => selectMode(true)}
@@ -107,6 +108,7 @@ export function ReadRetentionSettings({ csrfToken, onSessionExpired }: ReadReten
           <div className="read-retention-option">
             <input
               checked={!keepForever}
+              disabled={isLoading}
               id="read-retention-days-mode"
               name="read-retention-mode"
               onChange={() => selectMode(false)}
@@ -123,7 +125,7 @@ export function ReadRetentionSettings({ csrfToken, onSessionExpired }: ReadReten
             <label htmlFor="read-retention-days">Срок хранения, дней</label>
             <input
               className="input"
-              disabled={isSaving}
+              disabled={isLoading || isSaving}
               id="read-retention-days"
               max={maximumDays}
               min={minimumDays}
