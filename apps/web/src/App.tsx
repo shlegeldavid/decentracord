@@ -4,8 +4,7 @@ import {
   getChannels,
   markConversationRead,
   markChannelRead,
-  type Channel,
-  type ChannelCategory
+  type Channel
 } from "./api";
 import { ChannelMembersPanel } from "./components/ChannelMembersPanel";
 import { WorkspaceChannelSidebar } from "./components/WorkspaceChannelSidebar";
@@ -24,6 +23,7 @@ import { useMessageDelivery, useMessageQueue } from "./hooks/useMessageDelivery"
 import { useMessageHistoryPaging, useMessageHistoryState } from "./hooks/useMessageHistory";
 import { useTheme } from "./hooks/useTheme";
 import { useTimezone } from "./hooks/useTimezone";
+import { useWorkspaceChannels } from "./hooks/useWorkspaceChannels";
 import { useWorkspaceSession, type WorkspaceBootstrap } from "./hooks/useWorkspaceSession";
 import { messageScopeKey, type MessageScope } from "./lib/messageHistory";
 import { CONVERSATION_REALTIME, connectRealtime, type RealtimeStatus } from "./realtime";
@@ -31,7 +31,6 @@ import { bindChannelMessageEvents, bindConversationMessageEvents } from "./realt
 import { bindChannelEvents, bindSessionEvents, subscribeToReadableChannels, type ChannelSubscriptions } from "./realtimeWorkspaceEvents";
 
 type WorkspaceOverlay = "channels" | "members" | null;
-type RevokedChannel = { id: string; reason: string };
 
 const SIDEBAR_WIDTH_KEY = "decentracord:sidebar-width";
 const SIDEBAR_COLLAPSED_KEY = "decentracord:sidebar-collapsed";
@@ -90,15 +89,12 @@ function readInitialUncategorizedCollapsed(userId: string): boolean {
 export function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("account");
-  const [channels, setChannels] = useState<Channel[]>([]);
-  const [categories, setCategories] = useState<ChannelCategory[]>([]);
   const [channelPropertiesTarget, setChannelPropertiesTarget] = useState<Channel | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(readInitialSidebarWidth);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(readInitialSidebarCollapsed);
   const [collapsedCategoryIds, setCollapsedCategoryIds] = useState<Set<string>>(() => new Set());
   const [uncategorizedCollapsed, setUncategorizedCollapsed] = useState(false);
   const [openOverlay, setOpenOverlay] = useState<WorkspaceOverlay>(null);
-  const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null);
   const [accessDeniedChannelId, setAccessDeniedChannelId] = useState<string | null>(null);
   const [expandedChannelTopicId, setExpandedChannelTopicId] = useState<string | null>(null);
   const history = useMessageHistoryState();
@@ -106,11 +102,15 @@ export function App() {
     messages, hasMoreHistory, historyLoadState, clearHistory, resetHistory, resetHistoryStatus,
     getMaxAppliedSeq, setSelectedScope, forgetChannelHistory, applyHistoryMessage, markHistoryMessageDeleted
   } = history;
-  const [channelLastReadSeq, setChannelLastReadSeq] = useState<number | undefined>(undefined);
-  const [revokedChannel, setRevokedChannel] = useState<RevokedChannel | null>(null);
+  const {
+    channels, categories, selectedChannel, selectedId: selectedChannelId, selectedIdRef: selectedChannelIdRef,
+    revoked: revokedChannel, revokedRef: revokedChannelRef, unreadCounts, lastReadSeq: channelLastReadSeq,
+    channelsRef, findChannel, replaceChannels, setCategories, replaceChannelList, incrementUnread,
+    deselectChannel, resetChannelSession, leaveRevokedChannel, selectReadableChannel, confirmRead,
+    revokeSelectedChannel, reconcileChannelList
+  } = useWorkspaceChannels(resetHistoryStatus);
   const messageQueue = useMessageQueue();
   const { pendingMessages, resetQueue } = messageQueue;
-  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [messageInput, setMessageInput] = useState("");
   const [messageError, setMessageError] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -123,20 +123,13 @@ export function App() {
     element?.style.setProperty("--sidebar-width", sidebarCollapsed ? "48px" : `${sidebarWidth}px`);
   }, [sidebarCollapsed, sidebarWidth]);
   const realtimeSocket = useRef<ReturnType<typeof connectRealtime> | null>(null);
-  const channelsRef = useRef<Channel[]>([]);
-  const selectedChannelIdRef = useRef<string | null>(null);
-  const selectedChannelSnapshotRef = useRef<Channel | null>(null);
-  const revokedChannelRef = useRef<RevokedChannel | null>(null);
-  const unreadCountsRef = useRef<Record<string, number>>({});
   const channelSubscriptions = useRef<ChannelSubscriptions>(new Map());
 
   const leaveChannelForConversation = useCallback(() => {
-    setSelectedChannelId(null);
-    selectedChannelIdRef.current = null;
-    selectedChannelSnapshotRef.current = null;
+    deselectChannel();
     setAccessDeniedChannelId(null);
     setExpandedChannelTopicId(null);
-  }, []);
+  }, [deselectChannel]);
   const conversationState = useConversationState({ leaveChannel: leaveChannelForConversation, clearHistory });
   const {
     conversations, selectedId: selectedConversationId, selectedIdRef: selectedConversationIdRef,
@@ -151,46 +144,23 @@ export function App() {
   }, []);
   const { emitTyping, recordTyping, clearTyping, typingByConversation, typingLabelFor } = useConversationTyping(sendTyping);
 
-  const selectedChannel = revokedChannel?.id === selectedChannelId
-    ? selectedChannelSnapshotRef.current
-    : channels.find((channel) => channel.id === selectedChannelId) ?? null;
-  const replaceUnreadCounts = useCallback((items: Channel[], preserveCurrent: boolean) => {
-    const current = unreadCountsRef.current;
-    const next: Record<string, number> = {};
-    for (const channel of items) {
-      next[channel.id] = preserveCurrent && current[channel.id] !== undefined
-        ? current[channel.id]!
-        : channel.unreadCount ?? 0;
-    }
-    unreadCountsRef.current = next;
-    setUnreadCounts(next);
-  }, []);
-
   const applyWorkspaceBootstrap = useCallback((data: WorkspaceBootstrap | null) => {
     if (data) {
       setCollapsedCategoryIds(readInitialCollapsedCategories(data.user.id));
       setUncategorizedCollapsed(readInitialUncategorizedCollapsed(data.user.id));
       if (data.conversations !== undefined) loadConversations(data.conversations);
     }
-    const items = data?.channelData.channels ?? [];
-    channelsRef.current = items;
-    replaceUnreadCounts(items, false);
-    setChannels(items);
-    setCategories(data?.channelData.categories ?? []);
-    setSelectedChannelId(null);
-  }, [loadConversations, replaceUnreadCounts]);
+    replaceChannelList(data?.channelData ?? { channels: [], categories: [] }, "replace");
+    deselectChannel();
+  }, [deselectChannel, loadConversations, replaceChannelList]);
 
   const clearWorkspace = useCallback(() => {
     realtimeSocket.current?.disconnect();
     realtimeSocket.current = null;
     setAccessDeniedChannelId(null);
     setExpandedChannelTopicId(null);
-    selectedChannelIdRef.current = null;
-    selectedChannelSnapshotRef.current = null;
-    revokedChannelRef.current = null;
-    setRevokedChannel(null);
+    resetChannelSession();
     resetHistory();
-    setChannelLastReadSeq(undefined);
     resetQueue();
     resetConversations();
     // На экране входа заголовок вкладки не показывает непрочитанные сообщения.
@@ -204,7 +174,7 @@ export function App() {
     setOpenOverlay(null);
     setChannelPropertiesTarget(null);
     setRealtimeStatus("disconnected");
-  }, [clearTyping, resetConversations, resetHistory, resetQueue]);
+  }, [clearTyping, resetChannelSession, resetConversations, resetHistory, resetQueue]);
 
   const {
     screen, user, organization, csrfToken, loginValue, setLoginValue, submitLogin, handleLogout,
@@ -243,12 +213,6 @@ export function App() {
     }
   }, [uncategorizedCollapsed, user]);
 
-  const setChannelUnreadCount = useCallback((channelId: string, count: number) => {
-    const next = { ...unreadCountsRef.current, [channelId]: count };
-    unreadCountsRef.current = next;
-    setUnreadCounts(next);
-  }, []);
-
   const isSocketConnected = useCallback(() => realtimeSocket.current?.connected === true, []);
   const clearComposer = useCallback(() => setMessageInput(""), []);
   const { applyMessage, requeueSending, dropUnreadableChannels, rejectChannel, replayChannels, actions: messageActions } =
@@ -272,12 +236,6 @@ export function App() {
     subscribeToReadableChannels(realtimeSocket.current, channelSubscriptions.current, items);
   }, []);
 
-  useEffect(() => {
-    channelsRef.current = channels;
-    const selected = channels.find((channel) => channel.id === selectedChannelId);
-    if (selected?.canView && revokedChannelRef.current?.id !== selected.id) selectedChannelSnapshotRef.current = selected;
-  }, [channels, selectedChannelId]);
-
   // Заголовок вкладки: сумма непрочитанных по каналам и по перепискам
   // вместе. Только `title` — звука и системных уведомлений нет.
   useEffect(() => {
@@ -291,15 +249,10 @@ export function App() {
   }, [unreadCounts, conversations]);
 
   useEffect(() => {
-    selectedChannelIdRef.current = selectedChannelId;
     setSelectedScope(selectedConversationId
       ? messageScopeKey("conversation", selectedConversationId)
       : selectedChannelId ? messageScopeKey("channel", selectedChannelId) : null);
   }, [selectedChannelId, selectedConversationId, setSelectedScope]);
-
-  useEffect(() => {
-    if (!selectedChannelId) setChannelLastReadSeq(undefined);
-  }, [selectedChannelId]);
 
   const channelPins = useChannelPins({
     channelId: selectedChannelId,
@@ -313,16 +266,10 @@ export function App() {
   const markReadThroughAppliedMessages = useCallback((channelId: string) => {
     if (!csrfToken) return;
     const seq = getMaxAppliedSeq(messageScopeKey("channel", channelId));
-    void markChannelRead(channelId, seq, csrfToken).then(() => {
-      const nextChannels = channelsRef.current.map((channel) => channel.id === channelId
-        ? { ...channel, lastReadSeq: Math.max(channel.lastReadSeq ?? 0, seq) }
-        : channel);
-      channelsRef.current = nextChannels;
-      setChannels(nextChannels);
-    }).catch((error: unknown) => {
+    void markChannelRead(channelId, seq, csrfToken).then(confirmRead(channelId, seq)).catch((error: unknown) => {
       if (error instanceof ApiError && error.status === 401) clearPrivateSession();
     });
-  }, [csrfToken, clearPrivateSession, getMaxAppliedSeq]);
+  }, [confirmRead, csrfToken, clearPrivateSession, getMaxAppliedSeq]);
 
   // Курсор прочтения переписки: тот же путь, что у канала, но по области
   // `conversation:<id>`. Счётчик строки уже равен нулю, поэтому результат
@@ -346,32 +293,12 @@ export function App() {
   const { refreshConversations, onMessageCreated, startConversationWith } = conversationActions;
 
   const selectChannel = useCallback((channelId: string) => {
-    const channel = channelsRef.current.find((item) => item.id === channelId);
-    if (!channel?.canView) return;
-    const changedChannel = selectedChannelIdRef.current !== channelId;
+    if (!selectReadableChannel(channelId)) return;
     setAccessDeniedChannelId(null);
     setExpandedChannelTopicId(null);
-    selectedChannelSnapshotRef.current = channel;
-    setChannelLastReadSeq(channel.lastReadSeq ?? 0);
-    revokedChannelRef.current = null;
-    setRevokedChannel(null);
-    if (changedChannel) resetHistoryStatus("loading");
-    selectedChannelIdRef.current = channelId;
-    setSelectedChannelId(channelId);
     deselectConversation();
-    setChannelUnreadCount(channelId, 0);
     markReadThroughAppliedMessages(channelId);
-  }, [deselectConversation, markReadThroughAppliedMessages, resetHistoryStatus, setChannelUnreadCount]);
-
-  const leaveRevokedChannel = useCallback(() => {
-    revokedChannelRef.current = null;
-    setRevokedChannel(null);
-    selectedChannelSnapshotRef.current = null;
-    selectedChannelIdRef.current = null;
-    setSelectedChannelId(null);
-    setChannelLastReadSeq(undefined);
-    resetHistoryStatus();
-  }, [resetHistoryStatus]);
+  }, [deselectConversation, markReadThroughAppliedMessages, selectReadableChannel]);
 
   const toggleSidebarCollapsed = useCallback(() => {
     setAccessDeniedChannelId(null);
@@ -492,63 +419,14 @@ export function App() {
       active = false;
       clearPrivateSession();
     };
-    const markSelectedChannelRevoked = (channelId: string, reason = "Доступ к каналу отозван", inaccessibleChannel?: Channel) => {
-      const snapshot = inaccessibleChannel ?? selectedChannelSnapshotRef.current;
-      if (snapshot?.id === channelId) {
-        selectedChannelSnapshotRef.current = {
-          ...snapshot,
-          description: null,
-          canView: false,
-          canSend: false,
-          canManageMessages: false,
-          ownerEditable: false,
-          unreadCount: 0
-        };
-      }
-      const revoked = { id: channelId, reason };
-      revokedChannelRef.current = revoked;
-      setRevokedChannel(revoked);
-      resetHistoryStatus();
-    };
-    const clearUnavailableChannels = (items: Channel[]) => {
-      const readableChannelIds = new Set(items.filter((channel) => channel.canView).map((channel) => channel.id));
-      for (const channel of channelsRef.current) {
-        if (readableChannelIds.has(channel.id)) continue;
-        if (channel.canView) forgetChannelHistory(channel.id);
-        channelSubscriptions.current.delete(channel.id);
-      }
-      dropUnreadableChannels(readableChannelIds);
-    };
-    const syncSelectedChannel = (items: Channel[], preserveRevocationReason: boolean) => {
-      const selectedId = selectedChannelIdRef.current;
-      if (!selectedId) return;
-      const selected = items.find((channel) => channel.id === selectedId);
-      const revoked = revokedChannelRef.current;
-      if (!selected?.canView) {
-        const reason = (preserveRevocationReason || !selected) && revoked?.id === selectedId
-          ? revoked.reason
-          : undefined;
-        markSelectedChannelRevoked(selectedId, reason, selected);
-        return;
-      }
-      selectedChannelSnapshotRef.current = selected;
-      if (revoked?.id === selectedId) {
-        revokedChannelRef.current = null;
-        setRevokedChannel(null);
-      }
-    };
-    const applyChannelList = (items: Channel[], categories: ChannelCategory[], preserveUnread: boolean) => {
-      channelsRef.current = items;
-      replaceUnreadCounts(items, preserveUnread);
-      setChannels(items);
-      setCategories(categories);
+    const accessEffects = {
+      forgetHistory: forgetChannelHistory,
+      forgetSubscription: (channelId: string) => { channelSubscriptions.current.delete(channelId); },
+      dropUnreadableMessages: dropUnreadableChannels
     };
     const refreshChannels = () => {
-      void getChannels().then(({ channels: items, categories: categoryItems }) => {
-        if (!isCurrentConnection()) return;
-        syncSelectedChannel(items, false);
-        clearUnavailableChannels(items);
-        applyChannelList(items, categoryItems, false);
+      void getChannels().then((list) => {
+        if (isCurrentConnection()) reconcileChannelList(list, "http", accessEffects);
       }).catch((error: unknown) => {
         if (!isCurrentConnection()) return;
         if (error instanceof ApiError && error.status === 401) {
@@ -559,18 +437,11 @@ export function App() {
       });
     };
 
-    const findChannel = (id: string) => channelsRef.current.find((channel) => channel.id === id);
     bindChannelEvents(socket, channelSubscriptions.current, {
       findChannel,
       refresh: refreshChannels,
-      applySync: (items, categoryItems) => {
-        clearUnavailableChannels(items);
-        syncSelectedChannel(items, true);
-        applyChannelList(items, categoryItems, true);
-      },
-      revoke: (id, reason) => {
-        if (selectedChannelIdRef.current === id) markSelectedChannelRevoked(id, reason);
-      }
+      applySync: (channels, categories) => reconcileChannelList({ channels, categories }, "socket", accessEffects),
+      revoke: revokeSelectedChannel
     });
 
     async function recoverOpenScope(kind: MessageScope, id: string): Promise<boolean> {
@@ -613,7 +484,7 @@ export function App() {
       remove: ({ scopeId, messageId, updatedSeq }) =>
         markHistoryMessageDeleted(messageId, { scopeKey: messageScopeKey("channel", scopeId), updatedSeq }),
       markRead: markReadThroughAppliedMessages,
-      incrementUnread: (channelId) => setChannelUnreadCount(channelId, (unreadCountsRef.current[channelId] ?? 0) + 1),
+      incrementUnread,
       setPinned
     });
     bindConversationMessageEvents(socket, user.id, {
@@ -648,7 +519,7 @@ export function App() {
         realtimeSocket.current = null;
       }
     };
-  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUp, refreshConversations, replaceUnreadCounts, setChannelUnreadCount, requeueSending, dropUnreadableChannels, rejectChannel, replayChannels, markReadThroughAppliedMessages, applyConversations, forgetChannelHistory, markHistoryMessageDeleted, resetHistoryStatus, setPinned, onMessageCreated, clearUnread, recordTyping, clearTyping, selectedConversationIdRef]);
+  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUp, refreshConversations, incrementUnread, requeueSending, dropUnreadableChannels, rejectChannel, replayChannels, markReadThroughAppliedMessages, applyConversations, forgetChannelHistory, markHistoryMessageDeleted, setPinned, findChannel, reconcileChannelList, revokeSelectedChannel, channelsRef, selectedChannelIdRef, onMessageCreated, clearUnread, recordTyping, clearTyping, selectedConversationIdRef]);
 
   useEffect(() => {
     if (screen !== "authenticated" || !user) return;
@@ -700,12 +571,9 @@ export function App() {
           key={user.id}
           csrfToken={csrfToken}
           channelsRef={channelsRef}
-          replaceChannels={(items) => {
-            channelsRef.current = items;
-            setChannels(items);
-          }}
+          replaceChannels={replaceChannels}
+          replaceChannelList={replaceChannelList}
           setCategories={setCategories}
-          preserveUnreadCounts={(items) => replaceUnreadCounts(items, true)}
           onSessionExpired={clearPrivateSession}
           propertiesTarget={channelPropertiesTarget}
           onPropertiesTargetChange={setChannelPropertiesTarget}

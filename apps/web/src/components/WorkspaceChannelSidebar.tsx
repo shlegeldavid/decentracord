@@ -14,6 +14,7 @@ import {
   type ChannelCategory,
   type CreateChannelInput
 } from "../api";
+import type { ChannelList, ChannelUnreadPolicy } from "../hooks/useWorkspaceChannels";
 import { reorderChannel, swapCategories } from "../lib/channelOrder";
 import { CategoryDialog } from "./CategoryDialog";
 import { ChannelCategoryMenu } from "./ChannelCategoryMenu";
@@ -34,7 +35,7 @@ interface WorkspaceChannelSidebarProps extends Omit<ComponentProps<typeof Channe
   channelsRef: RefObject<Channel[]>;
   replaceChannels: (channels: Channel[]) => void;
   setCategories: Dispatch<SetStateAction<ChannelCategory[]>>;
-  preserveUnreadCounts: (channels: Channel[]) => void;
+  replaceChannelList: (list: ChannelList, unread: ChannelUnreadPolicy) => void;
   onSessionExpired: () => void;
   onCategoryError: (message: string | null) => void;
   propertiesTarget: Channel | null;
@@ -83,7 +84,7 @@ export function WorkspaceChannelSidebar({
   channelsRef,
   replaceChannels,
   setCategories,
-  preserveUnreadCounts,
+  replaceChannelList,
   onSessionExpired,
   onCategoryError,
   propertiesTarget,
@@ -137,9 +138,7 @@ export function WorkspaceChannelSidebar({
   async function refreshChannelList(preserveUnread: boolean): Promise<void> {
     const data = await getChannels();
     if (!active.current) return;
-    replaceChannels(data.channels);
-    setCategories(data.categories);
-    if (preserveUnread) preserveUnreadCounts(data.channels);
+    replaceChannelList(data, preserveUnread ? "preserve" : "unchanged");
   }
 
   function refreshAfterEdit(preserveUnread: boolean): void {
