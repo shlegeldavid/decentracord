@@ -123,4 +123,18 @@ test("accessibility of the workspace, sign-in, settings and account screens", as
   await openSettingsSection(page, "Настройки аккаунта");
   await waitForSettingsContent(page, "Настройки аккаунта");
   await expectAccessible(page, "настройки аккаунта");
+
+  const navigation = settingsDialog.getByRole("navigation", { name: "Разделы" });
+  const account = navigation.getByRole("button", { name: "Настройки аккаунта", exact: true });
+  const organization = navigation.getByRole("button", { name: "Организация", exact: true });
+  await account.press("ArrowDown");
+  await expect(organization).toBeFocused();
+  await expect(organization).toHaveAttribute("aria-current", "page");
+  await expect(settingsDialog.getByRole("heading", { name: "Организация", exact: true })).toBeVisible();
+  await organization.press("ArrowUp");
+  await expect(account).toBeFocused();
+  await expect(account).toHaveAttribute("aria-current", "page");
+  await page.keyboard.press("Escape");
+  await expect(settingsDialog).toHaveCount(0);
+  await expect(page.locator(".app-header").getByRole("button", { name: "Настройки", exact: true })).toBeFocused();
 });

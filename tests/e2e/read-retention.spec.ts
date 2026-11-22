@@ -21,14 +21,27 @@ function retentionBlock(page: Page) {
 test.describe("read retention settings", () => {
   test("administrator sets the retention period and keeps it after a reload", async ({ page, identity }) => {
     await loginAsAdmin(page, identity);
-    await openSettingsSection(page, "Организация");
+    const initialRead = Promise.withResolvers<void>();
+    await page.route("**/api/organization/read-retention", async (route) => {
+      await initialRead.promise;
+      await route.continue();
+    }, { times: 1 });
 
     const block = retentionBlock(page);
-    await expect(block).toBeVisible();
     const foreverOption = page.getByRole("radio", { name: "Хранить бессрочно" }).within(block);
     const daysOption = page.getByRole("radio", { name: "Хранить заданное число дней" }).within(block);
     const daysField = page.getByRole("spinbutton", { name: "Срок хранения, дней" }).within(block);
     const saveButton = page.getByRole("button", { name: "Сохранить срок хранения" }).within(block);
+
+    try {
+      await openSettingsSection(page, "Организация");
+      await expect(block).toBeVisible();
+      await expect(foreverOption).toBeDisabled();
+      await expect(daysOption).toBeDisabled();
+    } finally {
+      initialRead.resolve();
+    }
+    await expect(daysOption).toBeEnabled();
 
     // По умолчанию журнал хранится бессрочно, поля срока нет.
     await expect(foreverOption).toBeChecked();

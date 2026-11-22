@@ -132,12 +132,22 @@ test.describe("logout revokes only the current browser session", () => {
       await openSettingsSection(first.page, "Настройки аккаунта");
       await expect(first.page.getByRole("heading", { name: "Настройки аккаунта" })).toBeVisible();
 
-      await first.page.getByRole("textbox", { name: "Текущий пароль" }).fill(employee.password);
-      await first.page.getByRole("textbox", { name: "Новый пароль" }).fill(changedPassword);
+      const currentField = first.page.getByLabel("Текущий пароль", { exact: true });
+      const newField = first.page.getByLabel("Новый пароль", { exact: true });
+      await currentField.fill(employee.password);
+      await newField.fill(changedPassword);
+      await expect(currentField).toHaveAttribute("autocomplete", "current-password");
+      await expect(newField).toHaveAttribute("autocomplete", "new-password");
+      await first.page.getByRole("button", { name: "Показать текущий пароль" }).click();
+      await expect(currentField).toHaveAttribute("type", "text");
+      await expect(newField).toHaveAttribute("type", "password");
       await first.page.getByRole("button", { name: "Показать новый пароль" }).click();
-      await expect(first.page.getByRole("textbox", { name: "Новый пароль" })).toHaveAttribute("type", "text");
+      await expect(newField).toHaveAttribute("type", "text");
+      await first.page.getByRole("button", { name: "Скрыть текущий пароль" }).click();
+      await expect(currentField).toHaveAttribute("type", "password");
+      await expect(newField).toHaveAttribute("type", "text");
       await first.page.getByRole("button", { name: "Скрыть новый пароль" }).click();
-      await expect(first.page.getByRole("textbox", { name: "Новый пароль" })).toHaveAttribute("type", "password");
+      await expect(newField).toHaveAttribute("type", "password");
       await first.page.getByRole("button", { name: "Сменить пароль" }).click();
 
       await expect(first.page.getByRole("heading", { name: "Вход" })).toBeVisible();
