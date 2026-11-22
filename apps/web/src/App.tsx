@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ApiError,
-  getChannels,
   markConversationRead,
   markChannelRead,
   type Channel
@@ -24,11 +23,9 @@ import { useMessageHistoryPaging, useMessageHistoryState } from "./hooks/useMess
 import { useTheme } from "./hooks/useTheme";
 import { useTimezone } from "./hooks/useTimezone";
 import { useWorkspaceChannels } from "./hooks/useWorkspaceChannels";
+import { useWorkspaceConnection, useWorkspaceRealtime } from "./hooks/useWorkspaceRealtime";
 import { useWorkspaceSession, type WorkspaceBootstrap } from "./hooks/useWorkspaceSession";
-import { messageScopeKey, type MessageScope } from "./lib/messageHistory";
-import { CONVERSATION_REALTIME, connectRealtime, type RealtimeStatus } from "./realtime";
-import { bindChannelMessageEvents, bindConversationMessageEvents } from "./realtimeMessageEvents";
-import { bindChannelEvents, bindSessionEvents, subscribeToReadableChannels, type ChannelSubscriptions } from "./realtimeWorkspaceEvents";
+import { messageScopeKey } from "./lib/messageHistory";
 
 type WorkspaceOverlay = "channels" | "members" | null;
 
@@ -100,21 +97,22 @@ export function App() {
   const history = useMessageHistoryState();
   const {
     messages, hasMoreHistory, historyLoadState, clearHistory, resetHistory, resetHistoryStatus,
-    getMaxAppliedSeq, setSelectedScope, forgetChannelHistory, applyHistoryMessage, markHistoryMessageDeleted
+    getMaxAppliedSeq, setSelectedScope, applyHistoryMessage, markHistoryMessageDeleted
   } = history;
+  const channelState = useWorkspaceChannels(resetHistoryStatus);
   const {
     channels, categories, selectedChannel, selectedId: selectedChannelId, selectedIdRef: selectedChannelIdRef,
     revoked: revokedChannel, revokedRef: revokedChannelRef, unreadCounts, lastReadSeq: channelLastReadSeq,
-    channelsRef, findChannel, replaceChannels, setCategories, replaceChannelList, incrementUnread,
-    deselectChannel, resetChannelSession, leaveRevokedChannel, selectReadableChannel, confirmRead,
-    revokeSelectedChannel, reconcileChannelList
-  } = useWorkspaceChannels(resetHistoryStatus);
+    channelsRef, replaceChannels, setCategories, replaceChannelList,
+    deselectChannel, resetChannelSession, leaveRevokedChannel, selectReadableChannel, confirmRead
+  } = channelState;
   const messageQueue = useMessageQueue();
   const { pendingMessages, resetQueue } = messageQueue;
   const [messageInput, setMessageInput] = useState("");
   const [messageError, setMessageError] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>("connecting");
+  const connection = useWorkspaceConnection();
+  const { status: realtimeStatus, disconnect, reconnect, isConnected, sendTyping } = connection;
   const appShellElementRef = useRef<HTMLElement | null>(null);
   const overlayPanelRef = useRef<HTMLElement | null>(null);
   const overlayReturnFocusRef = useRef<HTMLElement | null>(null);
@@ -122,9 +120,6 @@ export function App() {
     appShellElementRef.current = element;
     element?.style.setProperty("--sidebar-width", sidebarCollapsed ? "48px" : `${sidebarWidth}px`);
   }, [sidebarCollapsed, sidebarWidth]);
-  const realtimeSocket = useRef<ReturnType<typeof connectRealtime> | null>(null);
-  const channelSubscriptions = useRef<ChannelSubscriptions>(new Map());
-
   const leaveChannelForConversation = useCallback(() => {
     deselectChannel();
     setAccessDeniedChannelId(null);
@@ -134,15 +129,10 @@ export function App() {
   const {
     conversations, selectedId: selectedConversationId, selectedIdRef: selectedConversationIdRef,
     selectedConversation, openConversation, isConversationHidden, loadConversations, resetConversations,
-    applyConversations, clearUnread, selectConversation, deselectConversation, closeOpenConversation
+    selectConversation, deselectConversation, closeOpenConversation
   } = conversationState;
-  const sendTyping = useCallback((conversationId: string): boolean => {
-    const socket = realtimeSocket.current;
-    if (!socket?.connected) return false;
-    socket.emit(CONVERSATION_REALTIME.typing, { conversationId });
-    return true;
-  }, []);
-  const { emitTyping, recordTyping, clearTyping, typingByConversation, typingLabelFor } = useConversationTyping(sendTyping);
+  const typing = useConversationTyping(sendTyping);
+  const { emitTyping, clearTyping, typingByConversation, typingLabelFor } = typing;
 
   const applyWorkspaceBootstrap = useCallback((data: WorkspaceBootstrap | null) => {
     if (data) {
@@ -155,8 +145,7 @@ export function App() {
   }, [deselectChannel, loadConversations, replaceChannelList]);
 
   const clearWorkspace = useCallback(() => {
-    realtimeSocket.current?.disconnect();
-    realtimeSocket.current = null;
+    disconnect();
     setAccessDeniedChannelId(null);
     setExpandedChannelTopicId(null);
     resetChannelSession();
@@ -167,14 +156,12 @@ export function App() {
     document.title = "Decentracord";
     setMessageInput("");
     setMessageError(null);
-    channelSubscriptions.current.clear();
     clearTyping();
     setSettingsOpen(false);
     setSettingsSection("account");
     setOpenOverlay(null);
     setChannelPropertiesTarget(null);
-    setRealtimeStatus("disconnected");
-  }, [clearTyping, resetChannelSession, resetConversations, resetHistory, resetQueue]);
+  }, [clearTyping, disconnect, resetChannelSession, resetConversations, resetHistory, resetQueue]);
 
   const {
     screen, user, organization, csrfToken, loginValue, setLoginValue, submitLogin, handleLogout,
@@ -213,28 +200,23 @@ export function App() {
     }
   }, [uncategorizedCollapsed, user]);
 
-  const isSocketConnected = useCallback(() => realtimeSocket.current?.connected === true, []);
   const clearComposer = useCallback(() => setMessageInput(""), []);
-  const { applyMessage, requeueSending, dropUnreadableChannels, rejectChannel, replayChannels, actions: messageActions } =
-    useMessageDelivery({
-      queue: messageQueue,
-      currentUserId: user?.id,
-      csrfToken,
-      realtimeStatus,
-      isSocketConnected,
-      channelIdRef: selectedChannelIdRef,
-      conversationIdRef: selectedConversationIdRef,
-      channelsRef,
-      applyHistoryMessage,
-      markHistoryMessageDeleted,
-      clearComposer,
-      onError: setMessageError,
-      onSessionExpired: clearPrivateSession
-    });
-
-  const subscribeToChannels = useCallback((items: Channel[]) => {
-    subscribeToReadableChannels(realtimeSocket.current, channelSubscriptions.current, items);
-  }, []);
+  const delivery = useMessageDelivery({
+    queue: messageQueue,
+    currentUserId: user?.id,
+    csrfToken,
+    realtimeStatus,
+    isSocketConnected: isConnected,
+    channelIdRef: selectedChannelIdRef,
+    conversationIdRef: selectedConversationIdRef,
+    channelsRef,
+    applyHistoryMessage,
+    markHistoryMessageDeleted,
+    clearComposer,
+    onError: setMessageError,
+    onSessionExpired: clearPrivateSession
+  });
+  const { applyMessage, actions: messageActions } = delivery;
 
   // Заголовок вкладки: сумма непрочитанных по каналам и по перепискам
   // вместе. Только `title` — звука и системных уведомлений нет.
@@ -290,7 +272,7 @@ export function App() {
     onError: setErrorMessage,
     onSessionExpired: clearPrivateSession
   });
-  const { refreshConversations, onMessageCreated, startConversationWith } = conversationActions;
+  const { refreshConversations, startConversationWith } = conversationActions;
 
   const selectChannel = useCallback((channelId: string) => {
     if (!selectReadableChannel(channelId)) return;
@@ -405,126 +387,22 @@ export function App() {
     if (channelId) await loadHistoryPage("channel", channelId, before);
   }, [loadHistoryPage]);
 
-  useEffect(() => {
-    if (screen !== "authenticated" || !user) return;
-
-    const socket = connectRealtime();
-    let active = true;
-    realtimeSocket.current = socket;
-    setRealtimeStatus("connecting");
-
-    const isCurrentConnection = () => active && realtimeSocket.current === socket;
-    const invalidate = () => {
-      if (!isCurrentConnection()) return;
-      active = false;
-      clearPrivateSession();
-    };
-    const accessEffects = {
-      forgetHistory: forgetChannelHistory,
-      forgetSubscription: (channelId: string) => { channelSubscriptions.current.delete(channelId); },
-      dropUnreadableMessages: dropUnreadableChannels
-    };
-    const refreshChannels = () => {
-      void getChannels().then((list) => {
-        if (isCurrentConnection()) reconcileChannelList(list, "http", accessEffects);
-      }).catch((error: unknown) => {
-        if (!isCurrentConnection()) return;
-        if (error instanceof ApiError && error.status === 401) {
-          invalidate();
-          return;
-        }
-        setErrorMessage("Не удалось загрузить данные установки. Обновите страницу и попробуйте снова.");
-      });
-    };
-
-    bindChannelEvents(socket, channelSubscriptions.current, {
-      findChannel,
-      refresh: refreshChannels,
-      applySync: (channels, categories) => reconcileChannelList({ channels, categories }, "socket", accessEffects),
-      revoke: revokeSelectedChannel
-    });
-
-    async function recoverOpenScope(kind: MessageScope, id: string): Promise<boolean> {
-      try {
-        await catchUp(kind, id);
-      } catch (error) {
-        if (!isCurrentConnection()) return false;
-        const status = error instanceof ApiError ? error.status : null;
-        if (status === 401) {
-          invalidate();
-          return false;
-        }
-        if (kind === "channel" && (status === 403 || status === 404)) {
-          rejectChannel(id, error);
-          refreshChannels();
-        } else {
-          const selectedId = kind === "channel" ? selectedChannelIdRef : selectedConversationIdRef;
-          if (selectedId.current === id) setMessageError("Не удалось обновить переписку");
-        }
-      }
-      return isCurrentConnection();
-    }
-
-    async function recoverAfterReconnect(): Promise<void> {
-      setRealtimeStatus("connected");
-      subscribeToChannels(channelsRef.current);
-      const channelId = selectedChannelIdRef.current;
-      const conversationId = selectedConversationIdRef.current;
-      if (channelId && !await recoverOpenScope("channel", channelId)) return;
-      if (conversationId && !await recoverOpenScope("conversation", conversationId)) return;
-      void refreshConversations();
-
-      await replayChannels(() => isCurrentConnection() && socket.connected);
-    }
-
-    bindChannelMessageEvents(socket, user.id, {
-      canView: (channelId) => findChannel(channelId)?.canView === true,
-      isSelected: (channelId) => selectedChannelIdRef.current === channelId,
-      apply: applyMessage,
-      remove: ({ scopeId, messageId, updatedSeq }) =>
-        markHistoryMessageDeleted(messageId, { scopeKey: messageScopeKey("channel", scopeId), updatedSeq }),
-      markRead: markReadThroughAppliedMessages,
-      incrementUnread,
-      setPinned
-    });
-    bindConversationMessageEvents(socket, user.id, {
-      apply: applyMessage,
-      isSelected: (conversationId) => selectedConversationIdRef.current === conversationId,
-      onCreated: onMessageCreated,
-      remove: ({ scopeId, messageId, updatedSeq }) =>
-        markHistoryMessageDeleted(messageId, { scopeKey: messageScopeKey("conversation", scopeId), updatedSeq }),
-      replaceConversations: applyConversations,
-      refreshConversations,
-      clearUnread,
-      recordTyping
-    });
-    bindSessionEvents(socket, {
-      ready: () => void recoverAfterReconnect(),
-      setStatus: setRealtimeStatus,
-      clearConnection: () => {
-        channelSubscriptions.current.clear();
-        clearTyping();
-      },
-      requeueSending,
-      invalidate
-    });
-    socket.connect();
-
-    return () => {
-      active = false;
-      socket.removeAllListeners();
-      socket.disconnect();
-      if (realtimeSocket.current === socket) {
-        channelSubscriptions.current.clear();
-        realtimeSocket.current = null;
-      }
-    };
-  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUp, refreshConversations, incrementUnread, requeueSending, dropUnreadableChannels, rejectChannel, replayChannels, markReadThroughAppliedMessages, applyConversations, forgetChannelHistory, markHistoryMessageDeleted, setPinned, findChannel, reconcileChannelList, revokeSelectedChannel, channelsRef, selectedChannelIdRef, onMessageCreated, clearUnread, recordTyping, clearTyping, selectedConversationIdRef]);
-
-  useEffect(() => {
-    if (screen !== "authenticated" || !user) return;
-    subscribeToChannels(channels);
-  }, [channels, screen, user, subscribeToChannels]);
+  useWorkspaceRealtime({
+    user,
+    connection,
+    channels: channelState,
+    conversations: conversationState,
+    conversationActions,
+    typing,
+    delivery,
+    history,
+    catchUp,
+    markChannelRead: markReadThroughAppliedMessages,
+    setPinned,
+    onSessionExpired: clearPrivateSession,
+    onRefreshError: setErrorMessage,
+    onHistoryError: setMessageError
+  });
 
   if (screen !== "authenticated" || !user || !organization || !csrfToken) {
     return (
@@ -549,7 +427,7 @@ export function App() {
         realtimeStatus={realtimeStatus}
         theme={theme}
         onToggleTheme={toggleTheme}
-        onReconnect={() => realtimeSocket.current?.connect()}
+        onReconnect={reconnect}
         onOpenSettings={() => {
           setAccessDeniedChannelId(null);
           setSettingsOpen(true);
