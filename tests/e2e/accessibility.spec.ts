@@ -73,6 +73,24 @@ test("accessibility of the workspace, sign-in, settings and account screens", as
   await expect(createdChannel).toBeVisible();
   const channelId = await createdChannel.getAttribute("data-channel-id");
   expect(channelId).toBeTruthy();
+  const overrideGrid = settingsDialog.locator(".override-grid");
+  const memberSend = overrideGrid.getByRole("combobox", { name: "SEND_MESSAGES для @everyone", exact: true });
+  const administrator = overrideGrid.getByRole("combobox", { name: "ADMINISTRATOR для @everyone", exact: true });
+  const saveOverrides = overrideGrid.getByRole("button", { name: "Сохранить переопределения", exact: true });
+  await expect(administrator).toBeDisabled();
+  await expect(memberSend).toHaveValue("unset");
+  for (const state of ["allow", "deny", "unset"]) {
+    await memberSend.selectOption(state);
+    const write = page.waitForResponse((response) =>
+      response.request().method() === "PUT" &&
+      new URL(response.url()).pathname === `/api/channels/${channelId}/overrides`
+    );
+    await saveOverrides.click();
+    expect((await write).status()).toBe(204);
+    await expect(overrideGrid).toHaveAttribute("aria-busy", "false");
+    await expect(memberSend).toHaveValue(state);
+    await expect(saveOverrides).toBeDisabled();
+  }
   const workspaceMessages = [
     "Accessibility sample message one",
     "Accessibility sample message two"

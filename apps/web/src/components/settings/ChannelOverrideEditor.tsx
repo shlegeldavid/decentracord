@@ -1,15 +1,11 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import {
   ApiError,
-  createCategory,
   createChannel,
-  deleteCategory as deleteCategoryRequest,
   getChannel,
   getChannels,
   getChannelSubjects,
-  reorderCategories as reorderCategoriesRequest,
-  renameCategory as renameCategoryRequest,
   renameChannel,
   updateChannelOverrides,
   type Channel,
@@ -18,9 +14,8 @@ import {
   type ChannelSubject,
   type ChannelSubjects
 } from "../../api";
-import { CategoryDialog } from "../CategoryDialog";
-import { ConfirmDialog } from "../ui/ConfirmDialog";
-import { PERMISSION_LABELS } from "../../lib/permissions";
+import { ChannelCategorySettings } from "./ChannelCategorySettings";
+import { ChannelPermissionGrid, matchesOverride, type OverrideSubject } from "./ChannelPermissionGrid";
 
 interface ChannelOverrideEditorProps {
   csrfToken: string;
@@ -28,26 +23,25 @@ interface ChannelOverrideEditorProps {
   onSessionExpired: () => void;
 }
 
-type OverrideSubject = {
-  subject: "everyone" | "role" | "member";
-  subjectId: string | null;
-  label: string;
-};
-
-const permissions = Object.keys(PERMISSION_LABELS) as Array<keyof typeof PERMISSION_LABELS>;
+const permissionErrors = new Map([
+  ["HIERARCHY", "Действие недоступно из-за иерархии ролей."],
+  ["MISSING_PERMISSION", "Нельзя выдать разрешение, которого нет у вас."]
+]);
+const channelErrors = new Map([
+  ["CHANNEL_ALREADY_EXISTS", "Канал с таким названием уже существует."],
+  ["CHANNEL_NOT_FOUND", "Канал больше недоступен. Обновите список каналов."],
+  ["CATEGORY_ALREADY_EXISTS", "Категория с таким названием уже существует."],
+  ["CATEGORY_NOT_FOUND", "Категория больше недоступна. Обновите список категорий."]
+]);
 
 export function requestError(error: unknown): string {
-  if (error instanceof ApiError) {
-    if (error.code === "HIERARCHY") return "Действие недоступно из-за иерархии ролей.";
-    if (error.code === "MISSING_PERMISSION") return "Нельзя выдать разрешение, которого нет у вас.";
-    if (error.code === "INVALID_REQUEST" || error.status === 400) return "Проверьте введённые значения.";
-    if (error.code === "FORBIDDEN" || error.status === 403) return "Недостаточно прав для этого действия.";
-    if (error.code === "CHANNEL_ALREADY_EXISTS") return "Канал с таким названием уже существует.";
-    if (error.code === "CHANNEL_NOT_FOUND") return "Канал больше недоступен. Обновите список каналов.";
-    if (error.code === "CATEGORY_ALREADY_EXISTS") return "Категория с таким названием уже существует.";
-    if (error.code === "CATEGORY_NOT_FOUND") return "Категория больше недоступна. Обновите список категорий.";
-  }
-  return "Не удалось выполнить запрос. Попробуйте ещё раз.";
+  const fallback = "Не удалось выполнить запрос. Попробуйте ещё раз.";
+  if (!(error instanceof ApiError)) return fallback;
+  const permissionError = permissionErrors.get(error.code);
+  if (permissionError) return permissionError;
+  if (error.code === "INVALID_REQUEST" || error.status === 400) return "Проверьте введённые значения.";
+  if (error.code === "FORBIDDEN" || error.status === 403) return "Недостаточно прав для этого действия.";
+  return channelErrors.get(error.code) ?? fallback;
 }
 
 function channelSubjects(value: ChannelSubjects): OverrideSubject[] {
@@ -56,35 +50,6 @@ function channelSubjects(value: ChannelSubjects): OverrideSubject[] {
     ...value.roles.map((role: ChannelSubject) => ({ subject: "role" as const, subjectId: role.id, label: role.name })),
     ...value.members.map((member) => ({ subject: "member" as const, subjectId: member.id, label: member.login }))
   ];
-}
-
-function currentEffect(
-  overrides: ChannelOverride[],
-  subject: OverrideSubject,
-  permission: string
-): "allow" | "deny" | "unset" {
-  return overrides.find((override) =>
-    override.subject === subject.subject &&
-    override.subjectId === subject.subjectId &&
-    override.permission === permission
-  )?.effect ?? "unset";
-}
-
-function sameOverrideSubject(override: ChannelOverride, subject: OverrideSubject, permission: string): boolean {
-  return override.subject === subject.subject &&
-    override.subjectId === subject.subjectId &&
-    override.permission === permission;
-}
-
-function channelCountLabel(count: number): string {
-  const lastTwo = count % 100;
-  const last = count % 10;
-  const word = last === 1 && lastTwo !== 11
-    ? "канал"
-    : last >= 2 && last <= 4 && (lastTwo < 12 || lastTwo > 14)
-      ? "канала"
-      : "каналов";
-  return `${count} ${word}`;
 }
 
 export function ChannelOverrideEditor({ csrfToken, onError, onSessionExpired }: ChannelOverrideEditorProps) {
@@ -104,13 +69,13 @@ export function ChannelOverrideEditor({ csrfToken, onError, onSessionExpired }: 
   const [isUpdatingOverrides, setIsUpdatingOverrides] = useState(false);
   const [editingName, setEditingName] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
-  const [categoryDialogMode, setCategoryDialogMode] = useState<"create" | "rename" | null>(null);
-  const [categoryDialogTarget, setCategoryDialogTarget] = useState<ChannelCategory | null>(null);
-  const [categoryDeleteTarget, setCategoryDeleteTarget] = useState<ChannelCategory | null>(null);
-  const [categoryDeleteError, setCategoryDeleteError] = useState<string | undefined>(undefined);
-  const [categoryOrderError, setCategoryOrderError] = useState<string | null>(null);
-  const [isDeletingCategory, setIsDeletingCategory] = useState(false);
-  const [isReorderingCategories, setIsReorderingCategories] = useState(false);
+
+  const handleRequestError = useCallback((error: unknown, report = false): string => {
+    const message = requestError(error);
+    if (error instanceof ApiError && error.status === 401) onSessionExpired();
+    else if (report) onError(message);
+    return message;
+  }, [onError, onSessionExpired]);
 
   useEffect(() => {
     let active = true;
@@ -122,29 +87,22 @@ export function ChannelOverrideEditor({ csrfToken, onError, onSessionExpired }: 
       setSelectedChannelId(channelData.channels[0]?.id ?? null);
     }).catch((error: unknown) => {
       if (!active) return;
-      if (error instanceof ApiError && error.status === 401) onSessionExpired();
-      else onError(requestError(error));
+      handleRequestError(error, true);
     }).finally(() => {
       if (active) setIsLoading(false);
     });
     return () => {
       active = false;
     };
-  }, [onError, onSessionExpired]);
+  }, [handleRequestError]);
 
   useEffect(() => {
-    if (!selectedChannelId) {
-      setSelectedChannel(null);
-      setOverrides([]);
-      setHasPendingOverrides(false);
-      setIsLoadingChannel(false);
-      return;
-    }
-    let active = true;
-    setIsLoadingChannel(true);
+    setIsLoadingChannel(Boolean(selectedChannelId));
     setSelectedChannel(null);
     setOverrides([]);
     setHasPendingOverrides(false);
+    if (!selectedChannelId) return;
+    let active = true;
     void getChannel(selectedChannelId).then((detail) => {
       if (!active) return;
       setSelectedChannel(detail.channel);
@@ -152,15 +110,14 @@ export function ChannelOverrideEditor({ csrfToken, onError, onSessionExpired }: 
       setRenameValue(detail.channel.name);
     }).catch((error: unknown) => {
       if (!active) return;
-      if (error instanceof ApiError && error.status === 401) onSessionExpired();
-      else onError(requestError(error));
+      handleRequestError(error, true);
     }).finally(() => {
       if (active) setIsLoadingChannel(false);
     });
     return () => {
       active = false;
     };
-  }, [onError, onSessionExpired, selectedChannelId]);
+  }, [handleRequestError, selectedChannelId]);
 
   async function refreshChannels(): Promise<Channel[]> {
     const { channels: items, categories: categoryItems } = await getChannels();
@@ -169,71 +126,13 @@ export function ChannelOverrideEditor({ csrfToken, onError, onSessionExpired }: 
     return items;
   }
 
-  function closeCategoryDialog(): void {
-    setCategoryDialogMode(null);
-    setCategoryDialogTarget(null);
-  }
-
-  async function handleCategoryDialogSubmit(name: string): Promise<void> {
-    if (!categoryDialogMode) return;
-    try {
-      if (categoryDialogMode === "create") {
-        const created = await createCategory(name, csrfToken);
-        setCategories((current) => [...current, created].sort((left, right) => left.position - right.position));
-      } else if (categoryDialogTarget) {
-        const updated = await renameCategoryRequest(categoryDialogTarget.id, name, csrfToken);
-        setCategories((current) => current.map((category) => category.id === updated.id ? updated : category));
-      }
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) onSessionExpired();
-      throw new Error(requestError(error));
-    }
-  }
-
-  async function handleReorderCategory(categoryId: string, direction: -1 | 1): Promise<void> {
-    if (isReorderingCategories) return;
-    const current = categories;
-    const index = current.findIndex((category) => category.id === categoryId);
-    const destination = index + direction;
-    if (index < 0 || destination < 0 || destination >= current.length) return;
-
-    const next = [...current];
-    [next[index], next[destination]] = [next[destination]!, next[index]!];
-    setCategories(next);
-    setCategoryOrderError(null);
-    setIsReorderingCategories(true);
-    try {
-      await reorderCategoriesRequest(next.map((category) => category.id), csrfToken);
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) onSessionExpired();
-      setCategories(current);
-      setCategoryOrderError("Не удалось сохранить порядок. Попробуйте ещё раз.");
-    } finally {
-      setIsReorderingCategories(false);
-    }
-  }
-
-  async function handleDeleteCategory(): Promise<void> {
-    const target = categoryDeleteTarget;
-    if (!target) return;
-    setCategoryDeleteError(undefined);
-    setIsDeletingCategory(true);
-    try {
-      await deleteCategoryRequest(target.id, csrfToken);
-      setCategories((current) => current.filter((category) => category.id !== target.id));
-      setChannels((current) => current.map((channel) => channel.categoryId === target.id
-        ? { ...channel, categoryId: null }
-        : channel));
-      setSelectedChannel((current) => current?.categoryId === target.id
-        ? { ...current, categoryId: null }
-        : current);
-      setCategoryDeleteTarget(null);
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) onSessionExpired();
-      setCategoryDeleteError("Не удалось удалить категорию. Попробуйте ещё раз.");
-    } finally {
-      setIsDeletingCategory(false);
-    }
+  function handleCategoryDeleted(categoryId: string): void {
+    setChannels((current) => current.map((channel) => channel.categoryId === categoryId
+      ? { ...channel, categoryId: null }
+      : channel));
+    setSelectedChannel((current) => current?.categoryId === categoryId
+      ? { ...current, categoryId: null }
+      : current);
   }
 
   async function handleCreate(event: FormEvent<HTMLFormElement>): Promise<void> {
@@ -247,8 +146,7 @@ export function ChannelOverrideEditor({ csrfToken, onError, onSessionExpired }: 
       setNewChannelName("");
       setStatusMessage(`Канал «${created.name}» создан.`);
     } catch (error) {
-      if (error instanceof ApiError && error.status === 401) onSessionExpired();
-      else onError(requestError(error));
+      handleRequestError(error, true);
     } finally {
       setIsCreating(false);
     }
@@ -267,8 +165,7 @@ export function ChannelOverrideEditor({ csrfToken, onError, onSessionExpired }: 
       setEditingName(false);
       setStatusMessage(`Название канала изменено на «${updated.name}».`);
     } catch (error) {
-      if (error instanceof ApiError && error.status === 401) onSessionExpired();
-      else onError(requestError(error));
+      handleRequestError(error, true);
     } finally {
       setIsRenaming(false);
     }
@@ -281,9 +178,7 @@ export function ChannelOverrideEditor({ csrfToken, onError, onSessionExpired }: 
   ): void {
     if (!selectedChannel) return;
     setStatusMessage(null);
-    const nextOverrides: ChannelOverride[] = overrides
-      .filter((override) => !sameOverrideSubject(override, subject, permission))
-      .map((override) => ({ ...override, effect: override.effect }));
+    const nextOverrides = overrides.filter((override) => !matchesOverride(override, subject, permission));
     nextOverrides.push({ subject: subject.subject, subjectId: subject.subjectId, permission, effect });
     setOverrides(nextOverrides);
     setHasPendingOverrides(true);
@@ -301,8 +196,7 @@ export function ChannelOverrideEditor({ csrfToken, onError, onSessionExpired }: 
       setChannels((current) => current.map((channel) => channel.id === detail.channel.id ? detail.channel : channel));
       setStatusMessage("Переопределения доступа сохранены.");
     } catch (error) {
-      if (error instanceof ApiError && error.status === 401) onSessionExpired();
-      else onError(requestError(error));
+      handleRequestError(error, true);
     } finally {
       setIsUpdatingOverrides(false);
     }
@@ -314,74 +208,16 @@ export function ChannelOverrideEditor({ csrfToken, onError, onSessionExpired }: 
       <p className="settings-copy">Создавайте каналы, меняйте их названия и настраивайте доступ для участников.</p>
       {statusMessage && <p className="form-success" aria-live="polite">{statusMessage}</p>}
 
-      <section className="settings-category-section" aria-label="Категории" aria-busy={isLoading || isReorderingCategories}>
-        <h3>Категории</h3>
-        <button
-          type="button"
-          className="btn-primary settings-category-create"
-          onClick={() => {
-            setCategoryDialogTarget(null);
-            setCategoryDialogMode("create");
-          }}
-        >
-          Создать категорию
-        </button>
-        {categoryOrderError && <p className="channel-dialog-error" role="alert">{categoryOrderError}</p>}
-        {isLoading ? (
-          <p className="loading-copy" aria-live="polite">Загружаем категории…</p>
-        ) : categories.length === 0 ? (
-          <p className="settings-category-empty">Категорий пока нет.</p>
-        ) : (
-          <div className="settings-category-list">
-            {categories.map((category, index) => (
-              <div className="settings-category-row" data-category-id={category.id} key={category.id}>
-                <span className="settings-category-count">
-                  {channelCountLabel(channels.filter((channel) => channel.categoryId === category.id).length)}
-                </span>
-                <span className="channel-category-name">{category.name}</span>
-                <span aria-hidden="true" />
-                <div className="settings-category-order">
-                  <button
-                    type="button"
-                    disabled={isReorderingCategories || index === 0}
-                    onClick={() => void handleReorderCategory(category.id, -1)}
-                  >
-                    Выше
-                  </button>
-                  <button
-                    type="button"
-                    disabled={isReorderingCategories || index === categories.length - 1}
-                    onClick={() => void handleReorderCategory(category.id, 1)}
-                  >
-                    Ниже
-                  </button>
-                </div>
-                <button
-                  type="button"
-                  disabled={isReorderingCategories}
-                  onClick={() => {
-                    setCategoryDialogTarget(category);
-                    setCategoryDialogMode("rename");
-                  }}
-                >
-                  Переименовать
-                </button>
-                <button
-                  type="button"
-                  className="button-danger"
-                  disabled={isDeletingCategory || isReorderingCategories}
-                  onClick={() => {
-                    setCategoryDeleteError(undefined);
-                    setCategoryDeleteTarget(category);
-                  }}
-                >
-                  Удалить
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
+      <ChannelCategorySettings
+        categories={categories}
+        channels={channels}
+        setCategories={setCategories}
+        csrfToken={csrfToken}
+        isLoading={isLoading}
+        onDeleteCategory={handleCategoryDeleted}
+        onRequestError={handleRequestError}
+        onError={onError}
+      />
 
       <form onSubmit={(event) => void handleCreate(event)} aria-busy={isCreating} data-channel-create-form>
         <label htmlFor="new-channel-name">Название канала</label>
@@ -468,53 +304,15 @@ export function ChannelOverrideEditor({ csrfToken, onError, onSessionExpired }: 
               </div>
 
               {selectedChannel.ownerEditable ? (
-                <div className="override-grid" aria-busy={isUpdatingOverrides}>
-                  <h3>Переопределения доступа</h3>
-                  <p className="settings-copy">Состояние «Не задано» наследует базовые разрешения роли.</p>
-                  {subjects.map((subject) => (
-                    <section className="override-subject" key={`${subject.subject}:${subject.subjectId ?? "everyone"}`}>
-                      <h4>{subject.label}</h4>
-                      {permissions.map((permission) => {
-                        const id = `override-${selectedChannel.id}-${subject.subject}-${subject.subjectId ?? "everyone"}-${permission}`;
-                        const administratorPermission = permission === "ADMINISTRATOR";
-                        const effect = currentEffect(overrides, subject, permission);
-                        return (
-                          <div className="override-row" key={permission}>
-                            <label htmlFor={id}>{PERMISSION_LABELS[permission]}</label>
-                            <select
-                              className="override-cell"
-                              id={id}
-                              aria-label={`${permission} для ${subject.label}`}
-                              data-state={effect}
-                              disabled={administratorPermission || isUpdatingOverrides}
-                              value={administratorPermission ? "unset" : effect}
-                              onChange={(event) => void handleOverrideChange(
-                                subject,
-                                permission,
-                                event.currentTarget.value as "allow" | "deny" | "unset"
-                              )}
-                            >
-                              <option value="unset">Не задано</option>
-                              <option value="allow">Разрешить</option>
-                              <option value="deny">Запретить</option>
-                            </select>
-                            {administratorPermission && (
-                              <p className="override-note">Выдаётся только владельцем установки в базовых правах роли.</p>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </section>
-                  ))}
-                  <button
-                    type="button"
-                    className="btn-primary"
-                    disabled={isUpdatingOverrides || !hasPendingOverrides}
-                    onClick={() => void handleSaveOverrides()}
-                  >
-                    {isUpdatingOverrides ? "Сохраняем…" : "Сохранить переопределения"}
-                  </button>
-                </div>
+                <ChannelPermissionGrid
+                  channelId={selectedChannel.id}
+                  subjects={subjects}
+                  overrides={overrides}
+                  isUpdatingOverrides={isUpdatingOverrides}
+                  hasPendingOverrides={hasPendingOverrides}
+                  onChange={handleOverrideChange}
+                  onSave={handleSaveOverrides}
+                />
               ) : (
                 <p className="settings-copy">Переопределения доступа не отображаются для этого канала.</p>
               )}
@@ -523,29 +321,6 @@ export function ChannelOverrideEditor({ csrfToken, onError, onSessionExpired }: 
         </div>
       )}
 
-      <CategoryDialog
-        open={categoryDialogMode !== null}
-        onClose={closeCategoryDialog}
-        mode={categoryDialogMode ?? "create"}
-        {...(categoryDialogTarget ? { initialName: categoryDialogTarget.name } : {})}
-        onSubmit={handleCategoryDialogSubmit}
-        onError={onError}
-      />
-      <ConfirmDialog
-        open={categoryDeleteTarget !== null}
-        title={`Удалить категорию «${categoryDeleteTarget?.name ?? ""}»`}
-        description="Каналы этой категории перейдут в раздел «Без категории». Переписка не пропадёт."
-        confirmCheckboxLabel="Подтверждаю удаление категории и перенос её каналов в «Без категории»"
-        confirmLabel="Удалить"
-        onConfirm={handleDeleteCategory}
-        onCancel={() => {
-          if (isDeletingCategory) return;
-          setCategoryDeleteTarget(null);
-          setCategoryDeleteError(undefined);
-        }}
-        busy={isDeletingCategory}
-        {...(categoryDeleteError ? { errorMessage: categoryDeleteError } : {})}
-      />
     </section>
   );
 }
