@@ -12,11 +12,21 @@ import {
   parseReorderCategoriesBody,
   parseReorderChannelsBody,
   parseUpdateChannelBody,
-  type ChannelOrderGroup,
   type ChannelSubject,
   type OverrideEffect,
   type OverrideInput
 } from "./channels.dto.js";
+import {
+  insertCategory,
+  moveChannelToCategory,
+  nextChannelPosition,
+  removeCategory,
+  updateCategoryName,
+  withChannelOrderLock,
+  writeCategoryOrder,
+  writeChannelOrder,
+  type ChannelCategorySummary
+} from "./channel-order.js";
 
 interface ChannelRow {
   id: string;
@@ -54,12 +64,6 @@ interface ChannelSummary {
   lastReadSeq: number;
 }
 
-interface ChannelCategorySummary {
-  id: string;
-  name: string;
-  position: number;
-}
-
 interface ChannelOverride {
   subject: ChannelSubject;
   subjectId: string | null;
@@ -77,10 +81,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function hasErrorCode(error: unknown, code: string): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === code;
-}
-
-function matchesIds<T>(actual: ReadonlySet<T>, expected: ReadonlySet<T>): boolean {
-  return actual.size === expected.size && [...actual].every((id) => expected.has(id));
 }
 
 function jsonArray(value: unknown): unknown[] {
@@ -120,30 +120,22 @@ function overrideArray(value: unknown): OverrideFact[] {
 }
 
 function auditChannel(event: string, actorUserId: string, channelId: string | null, outcome: string): void {
-  try {
-    process.stdout.write(`${JSON.stringify({
-      event,
-      actorUserId,
-      target: { type: "channel", id: channelId },
-      outcome
-    })}\n`);
-  } catch {
-    // Audit output must not change the channel-management result.
-  }
+  audit("channel", event, actorUserId, channelId, outcome);
 }
 
 function auditCategory(event: string, actorUserId: string, categoryId: string | null, outcome: string): void {
+  audit("category", event, actorUserId, categoryId, outcome);
+}
+
+function audit(type: "channel" | "category", event: string, actorUserId: string, id: string | null, outcome: string): void {
   try {
-    process.stdout.write(`${JSON.stringify({
-      event,
-      actorUserId,
-      target: { type: "category", id: categoryId },
-      outcome
-    })}\n`);
+    process.stdout.write(`${JSON.stringify({ event, actorUserId, target: { type, id }, outcome })}\n`);
   } catch {
-    // Audit output must not change the category-management result.
+    // Audit output must not change the management result.
   }
 }
+
+const categoryOutcomes = { create: "created", update: "updated", delete: "deleted" } as const;
 
 export class ChannelsService {
   constructor(
@@ -180,36 +172,7 @@ export class ChannelsService {
     if (!input) throw apiError(400, "INVALID_REQUEST", "Проверьте название категории");
     await this.requireChannelManager(principal);
 
-    let client: PoolClient | undefined;
-    let created: ChannelCategorySummary | undefined;
-    try {
-      client = await this.pool.connect();
-      await client.query("BEGIN");
-      await client.query("SELECT pg_advisory_xact_lock(21471, 901)");
-      const positionResult = await client.query<{ max_position: number }>(
-        "SELECT COALESCE(MAX(position), 0)::integer AS max_position FROM channel_categories"
-      );
-      const position = (positionResult.rows[0]?.max_position ?? 0) + 1;
-      const inserted = await client.query<ChannelCategorySummary>(
-        "INSERT INTO channel_categories (name, position) VALUES ($1, $2) RETURNING id::text AS id, name, position",
-        [input.name, position]
-      );
-      created = inserted.rows[0];
-      if (!created) throw new Error("Category was not created");
-      await client.query("COMMIT");
-      auditCategory("audit.category.create", principal.userId, created.id, "created");
-    } catch (error) {
-      await client?.query("ROLLBACK").catch(() => undefined);
-      auditCategory("audit.category.create", principal.userId, created?.id ?? null, hasErrorCode(error, "23505") ? "conflict" : "failed");
-      if (hasErrorCode(error, "23505")) {
-        throw apiError(409, "CATEGORY_ALREADY_EXISTS", "Категория с таким названием уже существует");
-      }
-      throw error;
-    } finally {
-      client?.release();
-    }
-    await this.notifyAllUsersChannelsChanged(principal.userId, created!.id);
-    return created!;
+    return this.changeCategory(principal, "create", null, (client) => insertCategory(client, input.name));
   }
 
   async renameCategory(principal: AuthPrincipal, categoryId: string, body: unknown): Promise<ChannelCategorySummary> {
@@ -218,83 +181,55 @@ export class ChannelsService {
     if (!input) throw apiError(400, "INVALID_REQUEST", "Проверьте название категории");
     await this.requireChannelManager(principal);
 
-    let client: PoolClient | undefined;
-    let updated: ChannelCategorySummary | undefined;
-    try {
-      client = await this.pool.connect();
-      await client.query("BEGIN");
-      await client.query("SELECT pg_advisory_xact_lock(21471, 901)");
-      const result = await client.query<ChannelCategorySummary>(
-        "UPDATE channel_categories SET name = $1, updated_at = now() WHERE id = $2 RETURNING id::text AS id, name, position",
-        [input.name, categoryId]
-      );
-      updated = result.rows[0];
-      if (!updated) throw apiError(404, "CATEGORY_NOT_FOUND", "Категория не найдена");
-      await client.query("COMMIT");
-    } catch (error) {
-      await client?.query("ROLLBACK").catch(() => undefined);
-      auditCategory("audit.category.update", principal.userId, categoryId, hasErrorCode(error, "23505") ? "conflict" : "failed");
-      if (hasErrorCode(error, "23505")) {
-        throw apiError(409, "CATEGORY_ALREADY_EXISTS", "Категория с таким названием уже существует");
-      }
-      throw error;
-    } finally {
-      client?.release();
-    }
-    auditCategory("audit.category.update", principal.userId, categoryId, "updated");
-    await this.notifyAllUsersChannelsChanged(principal.userId, categoryId);
-    return updated!;
+    return this.changeCategory(principal, "update", categoryId, (client) => updateCategoryName(client, categoryId, input.name));
   }
 
   async deleteCategory(principal: AuthPrincipal, categoryId: string): Promise<void> {
     this.assertCategoryId(categoryId);
     await this.requireChannelManager(principal);
 
-    let client: PoolClient | undefined;
-    try {
-      client = await this.pool.connect();
-      await client.query("BEGIN");
-      await client.query("SELECT pg_advisory_xact_lock(21471, 901)");
-      const deleted = await client.query<{ id: string }>(
-        "DELETE FROM channel_categories WHERE id = $1 RETURNING id::text AS id",
-        [categoryId]
-      );
-      if (!deleted.rows[0]) throw apiError(404, "CATEGORY_NOT_FOUND", "Категория не найдена");
-      await client.query(
-        `WITH ordered AS (
-          SELECT id, row_number() OVER (ORDER BY position ASC, lower(name) ASC, id ASC)::integer AS new_position
-          FROM channels
-          WHERE category_id IS NULL
-        )
-        UPDATE channels AS channel
-        SET position = ordered.new_position, updated_at = now()
-        FROM ordered
-        WHERE ordered.id = channel.id`
-      );
-      await client.query("COMMIT");
-    } catch (error) {
-      await client?.query("ROLLBACK").catch(() => undefined);
-      auditCategory("audit.category.delete", principal.userId, categoryId, "failed");
+    await this.changeCategory(principal, "delete", categoryId, (client) => removeCategory(client, categoryId));
+  }
+
+  private async changeCategory<T extends { id: string }>(
+    principal: AuthPrincipal,
+    action: keyof typeof categoryOutcomes,
+    categoryId: string | null,
+    write: (client: PoolClient) => Promise<T>
+  ): Promise<T> {
+    const event = `audit.category.${action}`;
+    let affectedId = categoryId;
+    const result = await withChannelOrderLock(this.pool, async (client) => {
+      const category = await write(client);
+      affectedId ??= category.id;
+      return category;
+    }).catch((error: unknown) => {
+      const conflict = action !== "delete" && hasErrorCode(error, "23505");
+      auditCategory(event, principal.userId, affectedId, conflict ? "conflict" : "failed");
+      if (conflict) throw apiError(409, "CATEGORY_ALREADY_EXISTS", "Категория с таким названием уже существует");
       throw error;
-    } finally {
-      client?.release();
-    }
-    auditCategory("audit.category.delete", principal.userId, categoryId, "deleted");
-    await this.notifyAllUsersChannelsChanged(principal.userId, categoryId);
+    });
+    auditCategory(event, principal.userId, affectedId, categoryOutcomes[action]);
+    await this.notifyAllUsersChannelsChanged(principal.userId, affectedId);
+    return result;
   }
 
   async reorderCategories(principal: AuthPrincipal, body: unknown): Promise<void> {
     const input = parseReorderCategoriesBody(body);
     if (!input) throw apiError(400, "INVALID_REQUEST", "Некорректный порядок категорий");
     await this.requireChannelManager(principal);
-    await this.reorderWithLock(principal, "category", (client) => this.writeCategoryOrder(client, input.categoryIds));
+    await this.reorderWithLock(principal, "category", (client) => writeCategoryOrder(client, input.categoryIds));
   }
 
   async reorderChannels(principal: AuthPrincipal, body: unknown): Promise<void> {
     const input = parseReorderChannelsBody(body);
     if (!input) throw apiError(400, "INVALID_REQUEST", "Некорректный порядок каналов");
     await this.requireChannelManager(principal);
-    await this.reorderWithLock(principal, "channel", (client) => this.writeChannelOrder(client, principal, input.groups));
+    await this.reorderWithLock(principal, "channel", (client) =>
+      writeChannelOrder(client, input.groups, async () =>
+        (await this.access.listVisibleChannels(principal, client)).map((channel) => channel.id)
+      )
+    );
   }
 
   private async reorderWithLock(
@@ -303,107 +238,12 @@ export class ChannelsService {
     writeOrder: (client: PoolClient) => Promise<void>
   ): Promise<void> {
     const event = `audit.${target}.reorder`;
-    const audit = target === "category" ? auditCategory : auditChannel;
-    let client: PoolClient | undefined;
-    try {
-      client = await this.pool.connect();
-      await client.query("BEGIN");
-      await client.query("SELECT pg_advisory_xact_lock(21471, 901)");
-      await writeOrder(client);
-      await client.query("COMMIT");
-    } catch (error) {
-      await client?.query("ROLLBACK").catch(() => undefined);
-      audit(event, principal.userId, null, "failed");
+    await withChannelOrderLock(this.pool, writeOrder).catch((error: unknown) => {
+      audit(target, event, principal.userId, null, "failed");
       throw error;
-    } finally {
-      client?.release();
-    }
-    audit(event, principal.userId, null, "reordered");
+    });
+    audit(target, event, principal.userId, null, "reordered");
     await this.notifyAllUsersChannelsChanged(principal.userId, null);
-  }
-
-  private async lockedCategoryIds(client: PoolClient): Promise<Set<string>> {
-    const { rows } = await client.query<{ id: string }>(
-      "SELECT id::text AS id FROM channel_categories ORDER BY position ASC, id ASC FOR UPDATE"
-    );
-    return new Set(rows.map((row) => row.id));
-  }
-
-  private async writeCategoryOrder(client: PoolClient, categoryIds: string[]): Promise<void> {
-    const existingIds = await this.lockedCategoryIds(client);
-    const submittedIds = new Set(categoryIds);
-    if (submittedIds.size === 0 || submittedIds.size !== categoryIds.length || !matchesIds(submittedIds, existingIds)) {
-      throw apiError(400, "INVALID_REQUEST", "Некорректный порядок категорий");
-    }
-
-    for (const [index, categoryId] of categoryIds.entries()) {
-      await client.query(
-        "UPDATE channel_categories SET position = $1, updated_at = now() WHERE id = $2",
-        [index + 1, categoryId]
-      );
-    }
-  }
-
-  private async writeChannelOrder(client: PoolClient, principal: AuthPrincipal, groups: ChannelOrderGroup[]): Promise<void> {
-    const existingCategoryIds = await this.lockedCategoryIds(client);
-    const currentChannels = await client.query<{
-      id: string;
-      category_id: string | null;
-      position: number;
-    }>(
-      `SELECT id::text AS id, category_id::text AS category_id, position
-       FROM channels
-       ORDER BY category_id NULLS FIRST, position ASC, lower(name) ASC, id ASC
-       FOR UPDATE`
-    );
-    const visibleChannels = await this.access.listVisibleChannels(principal, client);
-    const visibleIds = new Set(visibleChannels.map((channel) => channel.id));
-    const submittedIds = new Set(groups.flatMap((group) => group.channelIds));
-    const submittedCategoryIds = new Set(groups.map((group) => group.categoryId));
-    const expectedCategoryIds = new Set([null, ...existingCategoryIds]);
-    if (submittedCategoryIds.size !== groups.length ||
-      !matchesIds(submittedCategoryIds, expectedCategoryIds) ||
-      !matchesIds(submittedIds, visibleIds)) {
-      throw apiError(400, "INVALID_REQUEST", "Некорректный порядок каналов");
-    }
-
-    const hiddenByCategory = new Map<string | null, string[]>();
-    for (const channel of currentChannels.rows) {
-      if (visibleIds.has(channel.id)) continue;
-      const hidden = hiddenByCategory.get(channel.category_id) ?? [];
-      hidden.push(channel.id);
-      hiddenByCategory.set(channel.category_id, hidden);
-    }
-
-    // Keep hidden channels out of the client contract; retain their category and relative order server-side.
-    const completeGroups = groups.map((group) => ({
-      categoryId: group.categoryId,
-      channelIds: [...group.channelIds, ...(hiddenByCategory.get(group.categoryId) ?? [])]
-    }));
-
-    for (const group of completeGroups) {
-      for (const [index, channelId] of group.channelIds.entries()) {
-        await client.query(
-          "UPDATE channels SET category_id = $3, position = $1, updated_at = now() WHERE id = $2",
-          [index + 1, channelId, group.categoryId]
-        );
-      }
-    }
-
-    for (const { categoryId } of completeGroups) {
-      await client.query(
-        `WITH ordered AS (
-          SELECT id, row_number() OVER (ORDER BY position ASC, lower(name) ASC, id ASC)::integer AS new_position
-          FROM channels
-          WHERE category_id IS NOT DISTINCT FROM $1
-        )
-        UPDATE channels AS channel
-        SET position = ordered.new_position, updated_at = now()
-        FROM ordered
-        WHERE ordered.id = channel.id`,
-        [categoryId]
-      );
-    }
   }
 
   async listSubjects(principal: AuthPrincipal): Promise<{
@@ -450,80 +290,57 @@ export class ChannelsService {
     if (!input) throw apiError(400, "INVALID_REQUEST", "Проверьте название канала");
     await this.requireChannelManager(principal);
 
-    let client: PoolClient | undefined;
-    let created: ChannelRow | undefined;
-    try {
-      client = await this.pool.connect();
-      await client.query("BEGIN");
-      await client.query("SELECT pg_advisory_xact_lock(21471, 901)");
-      if (input.categoryId !== null) {
-        const category = await client.query<{ id: string }>(
-          "SELECT id::text AS id FROM channel_categories WHERE id = $1",
-          [input.categoryId]
-        );
-        if (!category.rows[0]) throw apiError(404, "CATEGORY_NOT_FOUND", "Категория не найдена");
-      }
-      const positionResult = await client.query<{ max_position: number }>(
-        "SELECT COALESCE(MAX(position), 0)::integer AS max_position FROM channels WHERE category_id IS NOT DISTINCT FROM $1",
-        [input.categoryId]
-      );
-      const position = (positionResult.rows[0]?.max_position ?? 0) + 1;
-      const inserted = await client.query<ChannelRow>(
+    const created = await withChannelOrderLock(this.pool, async (client) => {
+      const position = await nextChannelPosition(client, input.categoryId);
+      const { rows: [channel] } = await client.query<ChannelRow>(
         "INSERT INTO channels (name, position, description, visibility, category_id) VALUES ($1, $2, $3, 'hidden', $4) RETURNING id::text AS id, name, description, visibility",
         [input.name, position, input.description, input.categoryId]
       );
-      created = inserted.rows[0];
-      if (!created) throw new Error("Channel was not created");
+      if (!channel) throw new Error("Channel was not created");
       if (input.overrides.length > 0) {
         await this.findAffectedUsers(client, input.overrides);
-        await this.writeOverrides(client, created.id, input.overrides);
+        await this.writeOverrides(client, channel.id, input.overrides);
       }
-      await client.query("COMMIT");
-      auditChannel("audit.channel.create", principal.userId, created.id, "created");
-    } catch (error) {
-      await client?.query("ROLLBACK").catch(() => undefined);
-      auditChannel("audit.channel.create", principal.userId, null, hasErrorCode(error, "23505") ? "conflict" : "failed");
-      if (hasErrorCode(error, "23505")) {
-        throw apiError(409, "CHANNEL_ALREADY_EXISTS", "Канал с таким названием уже существует");
-      }
+      return channel;
+    }).catch((error: unknown) => {
+      const conflict = hasErrorCode(error, "23505");
+      auditChannel("audit.channel.create", principal.userId, null, conflict ? "conflict" : "failed");
+      if (conflict) throw apiError(409, "CHANNEL_ALREADY_EXISTS", "Канал с таким названием уже существует");
       throw error;
-    } finally {
-      client?.release();
-    }
+    });
+    auditChannel("audit.channel.create", principal.userId, created.id, "created");
     try {
       const users = await this.pool.query<{ id: string }>("SELECT id::text AS id FROM users WHERE active = true");
-      await this.notifyChannelAccess(users.rows.map((row) => row.id), created!.id, false, principal.userId);
+      await this.notifyChannelAccess(users.rows.map((row) => row.id), created.id, false, principal.userId);
     } catch {
-      auditChannel("audit.channel.realtime", principal.userId, created!.id, "notification_failed");
+      auditChannel("audit.channel.realtime", principal.userId, created.id, "notification_failed");
     }
     await this.notifyAllUsersChannelsChanged(principal.userId, input.categoryId);
-    return this.summaryFor(principal, created!);
+    return this.summaryFor(principal, created);
   }
 
   async update(principal: AuthPrincipal, channelId: string, body: unknown): Promise<ChannelSummary> {
     this.assertChannelId(channelId);
     const input = parseUpdateChannelBody(body);
     if (!input) throw apiError(400, "INVALID_REQUEST", "Проверьте данные канала");
-    const changesProperties = Object.hasOwn(input, "description") || Object.hasOwn(input, "visibility");
-    if (input.name !== undefined || changesProperties) {
+    const changesName = input.name !== undefined;
+    const changesDescription = Object.hasOwn(input, "description");
+    const changesVisibility = Object.hasOwn(input, "visibility");
+    const changesProperties = changesDescription || changesVisibility;
+    const movesCategory = Object.hasOwn(input, "categoryId");
+    if (changesName || changesProperties) {
       await this.access.requireChannelPermission(principal, channelId, "VIEW_CHANNEL");
     }
     await this.requireChannelManager(principal);
 
-    let client: PoolClient | undefined;
-    let updated: (ChannelRow & { description: string | null; visibility: "hidden" | "known"; category_id: string | null }) | undefined;
-    try {
-      client = await this.pool.connect();
-      await client.query("BEGIN");
-      await client.query("SELECT pg_advisory_xact_lock(21471, 901)");
-      const currentResult = await client.query<ChannelRow & { category_id: string | null }>(
+    const updated = await withChannelOrderLock(this.pool, async (client) => {
+      const { rows: [current] } = await client.query<ChannelRow & { category_id: string | null }>(
         "SELECT id::text AS id, name, category_id::text AS category_id FROM channels WHERE id = $1 FOR UPDATE",
         [channelId]
       );
-      const current = currentResult.rows[0];
       if (!current) throw apiError(404, "CHANNEL_NOT_FOUND", "Канал не найден");
 
-      const result = await client.query<ChannelRow & {
+      const { rows: [channel] } = await client.query<ChannelRow & {
         description: string | null;
         visibility: "hidden" | "known";
         category_id: string | null;
@@ -536,89 +353,34 @@ export class ChannelsService {
          WHERE id = $7
          RETURNING id::text AS id, name, description, visibility, category_id::text AS category_id`,
         [
-          input.name !== undefined,
+          changesName,
           input.name ?? null,
-          Object.hasOwn(input, "description"),
+          changesDescription,
           input.description ?? null,
-          Object.hasOwn(input, "visibility"),
+          changesVisibility,
           input.visibility ?? null,
           channelId
         ]
       );
-      updated = result.rows[0];
-      if (!updated) throw apiError(404, "CHANNEL_NOT_FOUND", "Канал не найден");
+      if (!channel) throw apiError(404, "CHANNEL_NOT_FOUND", "Канал не найден");
 
-      if (Object.hasOwn(input, "categoryId")) {
-        await this.moveChannelToCategory(client, channelId, input.categoryId ?? null, current.category_id);
+      if (movesCategory) await moveChannelToCategory(client, channelId, input.categoryId ?? null, current.category_id);
+      return channel;
+    }).catch((error: unknown) => {
+      const conflict = hasErrorCode(error, "23505");
+      if (changesName || changesProperties) {
+        auditChannel("audit.channel.update", principal.userId, channelId, conflict ? "conflict" : "failed");
       }
-      await client.query("COMMIT");
-      if (input.name !== undefined || changesProperties) auditChannel("audit.channel.update", principal.userId, channelId, "updated");
-      if (Object.hasOwn(input, "categoryId")) auditChannel("audit.channel.move", principal.userId, channelId, "updated");
-    } catch (error) {
-      await client?.query("ROLLBACK").catch(() => undefined);
-      if (input.name !== undefined || changesProperties) {
-        auditChannel("audit.channel.update", principal.userId, channelId, hasErrorCode(error, "23505") ? "conflict" : "failed");
-      }
-      if (Object.hasOwn(input, "categoryId")) auditChannel("audit.channel.move", principal.userId, channelId, "failed");
-      if (input.name !== undefined && hasErrorCode(error, "23505")) {
-        throw apiError(409, "CHANNEL_ALREADY_EXISTS", "Канал с таким названием уже существует");
-      }
+      if (movesCategory) auditChannel("audit.channel.move", principal.userId, channelId, "failed");
+      if (changesName && conflict) throw apiError(409, "CHANNEL_ALREADY_EXISTS", "Канал с таким названием уже существует");
       throw error;
-    } finally {
-      client?.release();
-    }
-    if (input.name !== undefined) {
-      await this.notifyChannelUpdate(channelId, { channelId, name: updated!.name }, principal.userId);
-    }
-    if (Object.hasOwn(input, "categoryId") || changesProperties) {
-      await this.notifyAllUsersChannelsChanged(principal.userId, channelId);
-    }
-    const summary = await this.summaryFor(principal, updated!);
-    return Object.hasOwn(input, "categoryId")
-      ? { ...summary, categoryId: input.categoryId ?? null }
-      : summary;
-  }
-
-  private async moveChannelToCategory(
-    client: PoolClient,
-    channelId: string,
-    categoryId: string | null,
-    previousCategoryId: string | null
-  ): Promise<void> {
-    if (categoryId !== null) {
-      const category = await client.query<{ id: string }>(
-        "SELECT id::text AS id FROM channel_categories WHERE id = $1",
-        [categoryId]
-      );
-      if (!category.rows[0]) throw apiError(404, "CATEGORY_NOT_FOUND", "Категория не найдена");
-    }
-
-    const positionResult = await client.query<{ max_position: number }>(
-      "SELECT COALESCE(MAX(position), 0)::integer AS max_position FROM channels WHERE category_id IS NOT DISTINCT FROM $1",
-      [categoryId]
-    );
-    const position = (positionResult.rows[0]?.max_position ?? 0) + 1;
-    const moved = await client.query<{ id: string }>(
-      "UPDATE channels SET category_id = $2, position = $3, updated_at = now() WHERE id = $1 RETURNING id::text AS id",
-      [channelId, categoryId, position]
-    );
-    if (!moved.rows[0]) throw apiError(404, "CHANNEL_NOT_FOUND", "Канал не найден");
-
-    const affectedCategories = new Set([previousCategoryId, categoryId]);
-    for (const affectedCategoryId of affectedCategories) {
-      await client.query(
-        `WITH ordered AS (
-          SELECT id, row_number() OVER (ORDER BY position ASC, lower(name) ASC, id ASC)::integer AS new_position
-          FROM channels
-          WHERE category_id IS NOT DISTINCT FROM $1
-        )
-        UPDATE channels AS channel
-        SET position = ordered.new_position, updated_at = now()
-        FROM ordered
-        WHERE ordered.id = channel.id`,
-        [affectedCategoryId]
-      );
-    }
+    });
+    if (changesName || changesProperties) auditChannel("audit.channel.update", principal.userId, channelId, "updated");
+    if (movesCategory) auditChannel("audit.channel.move", principal.userId, channelId, "updated");
+    if (changesName) await this.notifyChannelUpdate(channelId, { channelId, name: updated.name }, principal.userId);
+    if (movesCategory || changesProperties) await this.notifyAllUsersChannelsChanged(principal.userId, channelId);
+    const summary = await this.summaryFor(principal, updated);
+    return movesCategory ? { ...summary, categoryId: input.categoryId ?? null } : summary;
   }
 
   async setOverrides(principal: AuthPrincipal, channelId: string, body: unknown): Promise<void> {
