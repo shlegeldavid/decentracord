@@ -180,6 +180,24 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 const CHANNEL_SCOPE_PREFIX = "channel:";
 const CONVERSATION_SCOPE_PREFIX = "conversation:";
 
+const scopedMessageRequests = {
+  channel: {
+    prefix: CHANNEL_SCOPE_PREFIX,
+    send: sendMessage,
+    edit: editMessage,
+    remove: deleteMessage
+  },
+  conversation: {
+    prefix: CONVERSATION_SCOPE_PREFIX,
+    send: (id: string, content: string, clientRequestId: string, token: string) =>
+      sendConversationMessage(id, { content, clientRequestId }, token),
+    edit: editConversationMessage,
+    remove: deleteConversationMessage
+  }
+};
+
+type MessageScope = keyof typeof scopedMessageRequests;
+
 // Набор живёт только на клиенте: запись гаснет через 10 с без нового
 // события, отправка ограничена одним событием в 2 с.
 const TYPING_TTL_MS = 10_000;
@@ -1046,13 +1064,22 @@ export function App() {
     };
   }, [catchUpChannel, catchUpConversation, clearPrivateSession]);
 
-  const submitPendingMessage = useCallback(async (
-    channelId: string,
+  const setPendingDelivery = useCallback((clientRequestId: string, delivery: Pick<PendingMessage, "state" | "reason">) => {
+    updatePendingMessages((current) => current.map((message) => message.clientRequestId === clientRequestId
+      ? { ...message, ...delivery }
+      : message));
+  }, [updatePendingMessages]);
+
+  const submitScopedMessage = useCallback(async (
+    kind: MessageScope,
+    id: string,
     content: string,
     clientRequestId: string,
     token: string
   ): Promise<void> => {
-    const scopeKey = `${CHANNEL_SCOPE_PREFIX}${channelId}`;
+    const { prefix, send } = scopedMessageRequests[kind];
+    const selectedId = kind === "channel" ? selectedChannelIdRef : selectedConversationIdRef;
+    const scopeKey = `${prefix}${id}`;
     updatePendingMessages((current) => {
       const exists = current.some((message) => message.clientRequestId === clientRequestId);
       if (exists) {
@@ -1062,96 +1089,35 @@ export function App() {
       }
       return [...current, { scopeKey, content, clientRequestId, state: "sending" }];
     });
-    if (selectedChannelIdRef.current === channelId) {
-      setMessageError(null);
-      }
+    if (selectedId.current === id) setMessageError(null);
 
     try {
-      const message = await sendMessage(channelId, content, clientRequestId, token);
+      const message = await send(id, content, clientRequestId, token);
       applyMessage(message);
     } catch (error: unknown) {
-      if (error instanceof ApiError && error.status === 401) {
+      const apiError = error instanceof ApiError ? error : null;
+      if (apiError?.status === 401) {
         clearPrivateSession();
         return;
       }
-      if (error instanceof ApiError && (error.status === 403 || error.status === 404)) {
-        const reason = rejectedSendReason(error);
-        updatePendingMessages((current) => current.map((message) => message.clientRequestId === clientRequestId
-          ? { ...message, state: "rejected", reason }
-          : message));
+      if (apiError?.status === 403 || apiError?.status === 404) {
+        const reason = kind === "channel" ? rejectedSendReason(apiError) : apiError.message || "Отправка отклонена.";
+        setPendingDelivery(clientRequestId, { state: "rejected", reason });
         return;
       }
       if (!realtimeSocket.current?.connected) {
-        updatePendingMessages((current) => current.map((message) => message.clientRequestId === clientRequestId
-          ? { ...message, state: "queued" }
-          : message));
+        setPendingDelivery(clientRequestId, { state: "queued" });
         return;
       }
-      updatePendingMessages((current) => current.map((message) => message.clientRequestId === clientRequestId
-        ? { ...message, state: "failed" }
-        : message));
-      if (selectedChannelIdRef.current === channelId) {
-        const text = error instanceof ApiError && error.code === "SEND_NOT_ALLOWED"
+      setPendingDelivery(clientRequestId, { state: "failed" });
+      if (selectedId.current === id) {
+        const denied = kind === "channel" && apiError?.code === "SEND_NOT_ALLOWED";
+        setMessageError(denied
           ? "В этом канале запрещена отправка сообщений."
-          : error instanceof ApiError
-            ? error.message
-            : "Не удалось отправить сообщение. Попробуйте ещё раз.";
-        setMessageError(text);
+          : apiError?.message ?? "Не удалось отправить сообщение. Попробуйте ещё раз.");
       }
     }
-  }, [applyMessage, clearPrivateSession, updatePendingMessages]);
-
-  const submitConversationMessage = useCallback(async (
-    conversationId: string,
-    content: string,
-    clientRequestId: string,
-    token: string
-  ): Promise<void> => {
-    const scopeKey = `${CONVERSATION_SCOPE_PREFIX}${conversationId}`;
-    updatePendingMessages((current) => {
-      const exists = current.some((message) => message.clientRequestId === clientRequestId);
-      if (exists) {
-        return current.map((message) => message.clientRequestId === clientRequestId
-          ? { ...message, scopeKey, content, state: "sending" }
-          : message);
-      }
-      return [...current, { scopeKey, content, clientRequestId, state: "sending" }];
-    });
-    if (selectedConversationIdRef.current === conversationId) {
-      setMessageError(null);
-      }
-
-    try {
-      const message = await sendConversationMessage(conversationId, { content, clientRequestId }, token);
-      applyMessage(message);
-    } catch (error: unknown) {
-      if (error instanceof ApiError && error.status === 401) {
-        clearPrivateSession();
-        return;
-      }
-      if (error instanceof ApiError && (error.status === 403 || error.status === 404)) {
-        const reason = error.message || "Отправка отклонена.";
-        updatePendingMessages((current) => current.map((message) => message.clientRequestId === clientRequestId
-          ? { ...message, state: "rejected", reason }
-          : message));
-        return;
-      }
-      if (!realtimeSocket.current?.connected) {
-        updatePendingMessages((current) => current.map((message) => message.clientRequestId === clientRequestId
-          ? { ...message, state: "queued" }
-          : message));
-        return;
-      }
-      updatePendingMessages((current) => current.map((message) => message.clientRequestId === clientRequestId
-        ? { ...message, state: "failed" }
-        : message));
-      if (selectedConversationIdRef.current === conversationId) {
-        setMessageError(error instanceof ApiError
-          ? error.message
-          : "Не удалось отправить сообщение. Попробуйте ещё раз.");
-      }
-    }
-  }, [applyMessage, clearPrivateSession, updatePendingMessages]);
+  }, [applyMessage, clearPrivateSession, setPendingDelivery, updatePendingMessages]);
 
   useEffect(() => {
     if (screen !== "authenticated" || !user) return;
@@ -1310,7 +1276,7 @@ export function App() {
           if (!pendingMessagesRef.current.some((pending) => pending.clientRequestId === message.clientRequestId)) continue;
           const queuedChannelId = channelIdFromScope(message.scopeKey);
           if (queuedChannelId === null) continue;
-          await submitPendingMessage(queuedChannelId, message.content, message.clientRequestId, csrfToken);
+          await submitScopedMessage("channel", queuedChannelId, message.content, message.clientRequestId, csrfToken);
           if (!realtimeSocket.current?.connected) break;
         }
       })();
@@ -1459,7 +1425,7 @@ export function App() {
       socket.disconnect();
       if (realtimeSocket.current === socket) realtimeSocket.current = null;
     };
-  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUpChannel, catchUpConversation, refreshConversations, csrfToken, replaceUnreadCounts, setChannelUnreadCount, submitPendingMessage, updatePendingMessages, markReadThroughAppliedMessages, markConversationReadThroughApplied, applyConversations, observeMessageCursor]);
+  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUpChannel, catchUpConversation, refreshConversations, csrfToken, replaceUnreadCounts, setChannelUnreadCount, submitScopedMessage, updatePendingMessages, markReadThroughAppliedMessages, markConversationReadThroughApplied, applyConversations, observeMessageCursor]);
 
   useEffect(() => {
     const channelId = selectedChannelId;
@@ -1603,14 +1569,13 @@ export function App() {
     if (screen === "guest") loginInput.current?.focus();
   }, [screen]);
 
-  function handleComposerSubmit(scope: "channel" | "conversation", content: string, token: string): void {
-    const { id, prefix, send } = scope === "channel"
-      ? { id: selectedChannelIdRef.current, prefix: CHANNEL_SCOPE_PREFIX, send: submitPendingMessage }
-      : { id: selectedConversationIdRef.current, prefix: CONVERSATION_SCOPE_PREFIX, send: submitConversationMessage };
+  function handleComposerSubmit(kind: MessageScope, content: string, token: string): void {
+    const id = (kind === "channel" ? selectedChannelIdRef : selectedConversationIdRef).current;
     if (!id) return;
     setMessageInput("");
     const clientRequestId = createClientRequestId();
     if (realtimeStatus !== "connected" || !realtimeSocket.current?.connected) {
+      const { prefix } = scopedMessageRequests[kind];
       updatePendingMessages((current) => [...current, {
         scopeKey: `${prefix}${id}`,
         content,
@@ -1619,80 +1584,68 @@ export function App() {
       }]);
       return;
     }
-    void send(id, content, clientRequestId, token);
+    void submitScopedMessage(kind, id, content, clientRequestId, token);
   }
 
-  const handleRetryMessage = useCallback((clientRequestId: string) => {
+  const handleRetryMessage = useCallback((kind: MessageScope, clientRequestId: string) => {
     const message = pendingMessages.find((entry) => entry.clientRequestId === clientRequestId);
     if (!message || !csrfToken) return;
     if (realtimeStatus !== "connected" || !realtimeSocket.current?.connected) {
-      updatePendingMessages((current) => current.map((entry) => entry.clientRequestId === clientRequestId
-        ? { ...entry, state: "queued" }
-        : entry));
+      setPendingDelivery(clientRequestId, { state: "queued" });
       return;
     }
-    const channelId = channelIdFromScope(message.scopeKey);
-    if (channelId === null) return;
-    void submitPendingMessage(channelId, message.content, message.clientRequestId, csrfToken);
-  }, [pendingMessages, csrfToken, realtimeStatus, submitPendingMessage, updatePendingMessages]);
+    const { prefix } = scopedMessageRequests[kind];
+    if (!message.scopeKey.startsWith(prefix)) return;
+    const id = message.scopeKey.slice(prefix.length);
+    if (kind === "conversation" && !id) return;
+    void submitScopedMessage(kind, id, message.content, clientRequestId, csrfToken);
+  }, [pendingMessages, csrfToken, realtimeStatus, submitScopedMessage, setPendingDelivery]);
 
-  const retryConversationMessage = useCallback((clientRequestId: string) => {
-    const message = pendingMessages.find((entry) => entry.clientRequestId === clientRequestId);
-    if (!message || !csrfToken) return;
-    if (realtimeStatus !== "connected" || !realtimeSocket.current?.connected) {
-      updatePendingMessages((current) => current.map((entry) => entry.clientRequestId === clientRequestId
-        ? { ...entry, state: "queued" }
-        : entry));
-      return;
-    }
-    const conversationId = message.scopeKey.startsWith(CONVERSATION_SCOPE_PREFIX)
-      ? message.scopeKey.slice(CONVERSATION_SCOPE_PREFIX.length)
-      : null;
-    if (!conversationId) return;
-    void submitConversationMessage(conversationId, message.content, message.clientRequestId, csrfToken);
-  }, [pendingMessages, csrfToken, realtimeStatus, submitConversationMessage, updatePendingMessages]);
-
-  const handleEditMessage = useCallback(async (messageId: string, content: string): Promise<boolean> => {
-    const channelId = selectedChannelIdRef.current;
-    if (!channelId || !csrfToken) return false;
+  const handleEditMessage = useCallback(async (kind: MessageScope, messageId: string, content: string): Promise<boolean> => {
+    const selectedId = kind === "channel" ? selectedChannelIdRef : selectedConversationIdRef;
+    const id = selectedId.current;
+    if (!id || !csrfToken) return false;
     setMessageError(null);
     try {
-      const updated = await editMessage(channelId, messageId, content, csrfToken);
+      const updated = await scopedMessageRequests[kind].edit(id, messageId, content, csrfToken);
       applyMessage(updated);
       return true;
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
         clearPrivateSession();
-      } else if (selectedChannelIdRef.current === channelId) {
+      } else if (selectedId.current === id) {
         setMessageError(error instanceof ApiError ? error.message : "Не удалось изменить сообщение.");
       }
       return false;
     }
   }, [csrfToken, applyMessage, clearPrivateSession]);
 
-  const handleDeleteMessage = useCallback(async (messageId: string) => {
-    const channelId = selectedChannelIdRef.current;
-    if (!channelId || !csrfToken) return;
+  const handleDeleteMessage = useCallback(async (kind: MessageScope, messageId: string) => {
+    const selectedId = kind === "channel" ? selectedChannelIdRef : selectedConversationIdRef;
+    const id = selectedId.current;
+    if (!id || !csrfToken) return;
     setMessageError(null);
     try {
-      await deleteMessage(channelId, messageId, csrfToken);
-      if (selectedChannelIdRef.current === channelId) {
-        deletedMessageIdsRef.current.add(messageId);
-        setMessages((current) => current.map((message) => message.id === messageId
-          ? { ...message, deleted: true, content: "", mentions: [] }
-          : message));
-      }
+      await scopedMessageRequests[kind].remove(id, messageId, csrfToken);
+      if (selectedId.current !== id) return;
+      deletedMessageIdsRef.current.add(messageId);
+      setMessages((current) => current.map((message) => message.id === messageId
+        ? { ...message, deleted: true, content: "", mentions: [] }
+        : message));
     } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
+      const apiError = error instanceof ApiError ? error : null;
+      if (apiError?.status === 401) {
         clearPrivateSession();
-      } else if (selectedChannelIdRef.current === channelId) {
-        const text = error instanceof ApiError && error.status === 403
-          ? "Недостаточно прав для удаления этого сообщения"
-          : error instanceof ApiError
-            ? error.message
-            : "Не удалось удалить сообщение.";
-        setMessageError(text);
+        return;
       }
+      if (selectedId.current !== id) return;
+      if (kind === "conversation") {
+        setMessageError("Не удалось удалить сообщение. Попробуйте ещё раз.");
+        return;
+      }
+      setMessageError(apiError?.status === 403
+        ? "Недостаточно прав для удаления этого сообщения"
+        : apiError?.message ?? "Не удалось удалить сообщение.");
     }
   }, [csrfToken, clearPrivateSession]);
 
@@ -1705,49 +1658,6 @@ export function App() {
   const openReaders = useCallback((channelId: string, messageId: string) => {
     setReadersMessage({ channelId, messageId });
   }, []);
-
-  // Правка сообщения переписки: доступна только автору, окно правки проверяет
-  // сервер теми же тремя днями, что и в каналах.
-  const handleEditConversationMessage = useCallback(async (messageId: string, content: string): Promise<boolean> => {
-    const conversationId = selectedConversationIdRef.current;
-    if (!conversationId || !csrfToken) return false;
-    setMessageError(null);
-    try {
-      const updated = await editConversationMessage(conversationId, messageId, content, csrfToken);
-      applyMessage(updated);
-      return true;
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        clearPrivateSession();
-      } else if (selectedConversationIdRef.current === conversationId) {
-        setMessageError(error instanceof ApiError ? error.message : "Не удалось изменить сообщение.");
-      }
-      return false;
-    }
-  }, [csrfToken, applyMessage, clearPrivateSession]);
-
-  // Удаление своего сообщения переписки. Tombstone ставится локально, как в
-  // канале: ответ 204 тела не несёт.
-  const handleDeleteConversationMessage = useCallback(async (messageId: string) => {
-    const conversationId = selectedConversationIdRef.current;
-    if (!conversationId || !csrfToken) return;
-    setMessageError(null);
-    try {
-      await deleteConversationMessage(conversationId, messageId, csrfToken);
-      if (selectedConversationIdRef.current === conversationId) {
-        deletedMessageIdsRef.current.add(messageId);
-        setMessages((current) => current.map((message) => message.id === messageId
-          ? { ...message, deleted: true, content: "", mentions: [] }
-          : message));
-      }
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        clearPrivateSession();
-      } else if (selectedConversationIdRef.current === conversationId) {
-        setMessageError("Не удалось удалить сообщение. Попробуйте ещё раз.");
-      }
-    }
-  }, [csrfToken, clearPrivateSession]);
 
   // Пересылка в обе стороны: путь запроса выбирается по области
   // источника, а цель — канал или переписка — приходит из диалога.
@@ -2568,9 +2478,9 @@ export function App() {
                       onLoadEarlier={(before) => loadConversationEarlier(openConversation.id, before)}
                       messages={messages.filter((message) => message.conversationId === openConversation.id)}
                       canManageMessages={false}
-                      onRetry={retryConversationMessage}
-                      onEdit={handleEditConversationMessage}
-                      onDelete={(messageId) => void handleDeleteConversationMessage(messageId)}
+                      onRetry={(clientRequestId) => handleRetryMessage("conversation", clientRequestId)}
+                      onEdit={(messageId, content) => handleEditMessage("conversation", messageId, content)}
+                      onDelete={(messageId) => void handleDeleteMessage("conversation", messageId)}
                       canEdit={(message) => message.authorId === user.id}
                       canDelete={(message) => message.authorId === user.id}
                       onForward={(message) => {
@@ -2619,9 +2529,9 @@ export function App() {
                         article?.scrollIntoView({ behavior: "auto", block: "start" });
                         article?.focus({ preventScroll: true });
                       }}
-                      onRetry={handleRetryMessage}
-                      onEdit={handleEditMessage}
-                      onDelete={(messageId) => void handleDeleteMessage(messageId)}
+                      onRetry={(clientRequestId) => handleRetryMessage("channel", clientRequestId)}
+                      onEdit={(messageId, content) => handleEditMessage("channel", messageId, content)}
+                      onDelete={(messageId) => void handleDeleteMessage("channel", messageId)}
                       canEdit={canEditMessage}
                       canSeeReaders={(message) => message.authorId === user.id}
                       onOpenReaders={(message) => {
