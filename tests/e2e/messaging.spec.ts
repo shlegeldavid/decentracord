@@ -711,6 +711,14 @@ test.describe("channel messaging and reconnection", () => {
       const originalId = await messageWithText(manager.page, "history-item-54").getAttribute("data-message-id");
       expect(originalId).toBeTruthy();
       const original = manager.page.locator(`[data-message-id="${originalId}"]`);
+      const menu = manager.page.getByRole("menu", { name: "Действия с сообщением" });
+      await original.dispatchEvent("pointerdown", {
+        pointerId: 1, pointerType: "touch", clientX: 80, clientY: 80, bubbles: true
+      });
+      await expect(menu).toBeVisible();
+      await manager.page.keyboard.press("Escape");
+      await expect(menu).toHaveCount(0);
+
       const revisedContent = "history-item-54 revised after reload";
       const editResponse = manager.page.waitForResponse((response) =>
         response.request().method() === "PATCH" && response.url().endsWith(`/messages/${originalId}`)
