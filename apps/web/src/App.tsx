@@ -22,8 +22,6 @@ import {
   getPinnedMessages,
   isChannel,
   isChannelCategory,
-  isConversation,
-  isMessage,
   listConversations,
   markConversationRead,
   moveChannelToCategory as moveChannelToCategoryRequest,
@@ -77,7 +75,8 @@ import type { ReorderDropTarget, ReorderItem } from "./components/useDragReorder
 import { useTheme } from "./hooks/useTheme";
 import { useTimezone } from "./hooks/useTimezone";
 import { reorderChannel, swapCategories } from "./lib/channelOrder";
-import { CHANNEL_REALTIME, CONVERSATION_REALTIME, MESSAGE_REALTIME, connectRealtime, type RealtimeStatus } from "./realtime";
+import { CHANNEL_REALTIME, CONVERSATION_REALTIME, connectRealtime, type RealtimeStatus } from "./realtime";
+import { bindChannelMessageEvents, bindConversationMessageEvents } from "./realtimeMessageEvents";
 
 type ScreenState = "loading" | "guest" | "authenticated";
 type WorkspaceOverlay = "channels" | "members" | null;
@@ -205,48 +204,6 @@ function isChannelsSync(value: unknown): value is { channels: Channel[]; categor
 function channelIdFromEvent(value: unknown): string | null {
   if (!isRecord(value) || typeof value.channelId !== "string" || value.channelId.length === 0) return null;
   return value.channelId;
-}
-
-function messageFromEvent(value: unknown): MessageView | null {
-  if (!isRecord(value) || !isMessage(value.message)) return null;
-  return value.message;
-}
-
-function deletedMessageFromEvent(value: unknown): { messageId: string; channelId: string; updatedSeq: number } | null {
-  if (!isRecord(value) ||
-      typeof value.messageId !== "string" ||
-      typeof value.channelId !== "string" ||
-      typeof value.updatedSeq !== "number") return null;
-  return { messageId: value.messageId, channelId: value.channelId, updatedSeq: value.updatedSeq };
-}
-
-function deletedConversationMessageFromEvent(
-  value: unknown
-): { messageId: string; conversationId: string; updatedSeq: number } | null {
-  if (!isRecord(value) ||
-      typeof value.messageId !== "string" ||
-      typeof value.conversationId !== "string" ||
-      typeof value.updatedSeq !== "number") return null;
-  return { messageId: value.messageId, conversationId: value.conversationId, updatedSeq: value.updatedSeq };
-}
-
-// Событие переписки несёт её идентификатор в конверте: сообщение применяется,
-// только если оно принадлежит той же переписке.
-function conversationMessageFromEvent(
-  value: unknown
-): { conversationId: string; message: MessageView } | null {
-  if (!isRecord(value) ||
-      typeof value.conversationId !== "string" ||
-      !isMessage(value.message) ||
-      value.message.conversationId !== value.conversationId) return null;
-  return { conversationId: value.conversationId, message: value.message };
-}
-
-function pinFromEvent(value: unknown): { messageId: string; channelId: string } | null {
-  if (!isRecord(value) ||
-      typeof value.messageId !== "string" ||
-      typeof value.channelId !== "string") return null;
-  return { messageId: value.messageId, channelId: value.channelId };
 }
 
 function createClientRequestId(): string {
@@ -1250,31 +1207,45 @@ export function App() {
         return pendingChannelId === null || readableChannelIds.has(pendingChannelId);
       }));
     };
+    const syncSelectedChannel = (items: Channel[], preserveRevocationReason: boolean) => {
+      const selectedId = selectedChannelIdRef.current;
+      if (!selectedId) return;
+      const selected = items.find((channel) => channel.id === selectedId);
+      const revoked = revokedChannelRef.current;
+      if (!selected?.canView) {
+        const reason = (preserveRevocationReason || !selected) && revoked?.id === selectedId
+          ? revoked.reason
+          : undefined;
+        markSelectedChannelRevoked(selectedId, reason, selected);
+        return;
+      }
+      selectedChannelSnapshotRef.current = selected;
+      if (revoked?.id === selectedId) {
+        revokedChannelRef.current = null;
+        setRevokedChannel(null);
+      }
+    };
+    const applyChannelList = (items: Channel[], categories: ChannelCategory[], preserveUnread: boolean) => {
+      channelsRef.current = items;
+      replaceUnreadCounts(items, preserveUnread);
+      setChannels(items);
+      setCategories(categories);
+    };
+    const clearChannelSubscriptions = () => {
+      channelSubscriptions.current.confirmed.clear();
+      channelSubscriptions.current.pending.clear();
+    };
+    const queueSendingMessages = () => {
+      updatePendingMessages((current) => current.map((message) =>
+        message.state === "sending" ? { ...message, state: "queued" } : message
+      ));
+    };
     const refreshChannels = () => {
       void getChannels().then(({ channels: items, categories: categoryItems }) => {
         if (!active) return;
-        const selectedId = selectedChannelIdRef.current;
-        if (selectedId) {
-          const selected = items.find((channel) => channel.id === selectedId);
-          if (selected?.canView) {
-            selectedChannelSnapshotRef.current = selected;
-            if (revokedChannelRef.current?.id === selectedId) {
-              revokedChannelRef.current = null;
-              setRevokedChannel(null);
-            }
-          } else if (selected) {
-            markSelectedChannelRevoked(selectedId, undefined, selected);
-          } else {
-            markSelectedChannelRevoked(selectedId, revokedChannelRef.current?.id === selectedId
-              ? revokedChannelRef.current.reason
-              : "Доступ к каналу отозван");
-          }
-        }
+        syncSelectedChannel(items, false);
         clearUnavailableChannels(items);
-        channelsRef.current = items;
-        replaceUnreadCounts(items, false);
-        setChannels(items);
-        setCategories(categoryItems);
+        applyChannelList(items, categoryItems, false);
       }).catch((error: unknown) => {
         if (!active) return;
         if (error instanceof ApiError && error.status === 401) {
@@ -1348,32 +1319,14 @@ export function App() {
       if (typeof value === "object" && value !== null && "code" in value && value.code === "SESSION_REVOKED") invalidate();
     });
     socket.on(CHANNEL_REALTIME.sync, (value: unknown) => {
-      channelSubscriptions.current.confirmed.clear();
-      channelSubscriptions.current.pending.clear();
+      clearChannelSubscriptions();
       if (!isChannelsSync(value)) {
         refreshChannels();
         return;
       }
       clearUnavailableChannels(value.channels);
-      const selectedId = selectedChannelIdRef.current;
-      if (selectedId) {
-        const currentSelected = value.channels.find((channel) => channel.id === selectedId);
-        if (currentSelected?.canView) {
-          selectedChannelSnapshotRef.current = currentSelected;
-          if (revokedChannelRef.current?.id === selectedId) {
-            revokedChannelRef.current = null;
-            setRevokedChannel(null);
-          }
-        } else {
-          markSelectedChannelRevoked(selectedId, revokedChannelRef.current?.id === selectedId
-            ? revokedChannelRef.current.reason
-            : "Доступ к каналу отозван", currentSelected);
-        }
-      }
-      channelsRef.current = value.channels;
-      replaceUnreadCounts(value.channels, true);
-      setChannels(value.channels);
-      setCategories(value.categories);
+      syncSelectedChannel(value.channels, true);
+      applyChannelList(value.channels, value.categories, true);
     });
     socket.on(CHANNEL_REALTIME.updated, (value: unknown) => {
       const channelId = channelIdFromEvent(value);
@@ -1407,85 +1360,35 @@ export function App() {
     socket.on(CHANNEL_REALTIME.subscribeError, (value: unknown) => {
       const channelId = channelIdFromEvent(value);
       if (!channelId) {
-        channelSubscriptions.current.confirmed.clear();
-        channelSubscriptions.current.pending.clear();
+        clearChannelSubscriptions();
       } else {
         channelSubscriptions.current.pending.delete(channelId);
         channelSubscriptions.current.confirmed.delete(channelId);
       }
       refreshChannels();
     });
-    socket.on(MESSAGE_REALTIME.created, (value: unknown) => {
-      const message = messageFromEvent(value);
-      if (!message || message.channelId === null) return;
-      const channelId = message.channelId;
-      if (!channelsRef.current.some((channel) => channel.id === channelId && channel.canView)) return;
-      if (channelId === selectedChannelIdRef.current) {
-        const hasGap = applyMessage(message);
-        if (!hasGap) markReadThroughAppliedMessages(channelId);
-      } else if (message.authorId !== user.id) {
-        setChannelUnreadCount(channelId, (unreadCountsRef.current[channelId] ?? 0) + 1);
-      }
-    });
-    socket.on(MESSAGE_REALTIME.updated, (value: unknown) => {
-      const message = messageFromEvent(value);
-      if (!message || message.channelId === null) return;
-      if (!channelsRef.current.some((channel) => channel.id === message.channelId && channel.canView)) return;
-      if (message.channelId === selectedChannelIdRef.current) applyMessage(message);
-    });
-    socket.on(MESSAGE_REALTIME.deleted, (value: unknown) => {
-      const deleted = deletedMessageFromEvent(value);
-      if (!deleted || !channelsRef.current.some((channel) => channel.id === deleted.channelId && channel.canView)) return;
-      if (deleted.channelId === selectedChannelIdRef.current) {
-        deletedMessageIdsRef.current.add(deleted.messageId);
-        observeMessageCursor(`${CHANNEL_SCOPE_PREFIX}${deleted.channelId}`, deleted.updatedSeq);
-        setMessages((current) => current.map((message) => message.id === deleted.messageId
-          ? { ...message, updatedSeq: deleted.updatedSeq, deleted: true, content: "", mentions: [] }
-          : message));
-        // Удалённое сообщение снимает закрепление.
-        setPinnedMessageIds((current) => {
-          if (!current.has(deleted.messageId)) return current;
-          const next = new Set(current);
-          next.delete(deleted.messageId);
-          return next;
-        });
-      }
-    });
-    socket.on(MESSAGE_REALTIME.pinned, (value: unknown) => {
-      const pinned = pinFromEvent(value);
-      if (!pinned || !channelsRef.current.some((channel) => channel.id === pinned.channelId && channel.canView)) return;
-      if (selectedChannelIdRef.current !== pinned.channelId) return;
+    const removeRealtimeMessage = (scopeKey: ScopeKey, messageId: string, updatedSeq: number) => {
+      deletedMessageIdsRef.current.add(messageId);
+      observeMessageCursor(scopeKey, updatedSeq);
+      setMessages((current) => current.map((message) => message.id === messageId
+        ? { ...message, updatedSeq, deleted: true, content: "", mentions: [] }
+        : message));
+    };
+    const setRealtimePin = (messageId: string, pinned: boolean) => {
       setPinnedMessageIds((current) => {
-        if (current.has(pinned.messageId)) return current;
+        if (current.has(messageId) === pinned) return current;
         const next = new Set(current);
-        next.add(pinned.messageId);
+        if (pinned) next.add(messageId);
+        else next.delete(messageId);
         return next;
       });
-    });
-    socket.on(MESSAGE_REALTIME.unpinned, (value: unknown) => {
-      const unpinned = pinFromEvent(value);
-      if (!unpinned || !channelsRef.current.some((channel) => channel.id === unpinned.channelId && channel.canView)) return;
-      if (selectedChannelIdRef.current !== unpinned.channelId) return;
-      setPinnedMessageIds((current) => {
-        if (!current.has(unpinned.messageId)) return current;
-        const next = new Set(current);
-        next.delete(unpinned.messageId);
-        return next;
-      });
-    });
-    socket.on("conversation:message:created", (value: unknown) => {
-      const event = conversationMessageFromEvent(value);
-      if (!event) return;
-      const { conversationId, message } = event;
-      applyMessage(message);
-
+    };
+    const onConversationMessage = (conversationId: string, message: MessageView) => {
       const isOpen = selectedConversationIdRef.current === conversationId;
       const known = conversationsRef.current.some((conversation) => conversation.id === conversationId);
-      // Строка и счётчик обновляются локально: список на каждое сообщение сервер
-      // не рассылает.
+      // Строка обновляется локально: сервер не рассылает список на каждое сообщение.
       setConversations((current) => {
         const index = current.findIndex((conversation) => conversation.id === conversationId);
-        if (index < 0) return current;
         const target = current[index];
         if (!target) return current;
         const unreadCount = isOpen || message.authorId === user.id ? target.unreadCount : target.unreadCount + 1;
@@ -1494,8 +1397,7 @@ export function App() {
       });
 
       if (!known) {
-        // Переписка была закрыта мной: сервер уже снял `closed_at`, поэтому
-        // строка возвращается одним добором списка — не чаще раза в 2 с на строку.
+        // Закрытый диалог возвращается одним добором списка, не чаще раза в 2 с.
         const lastRefresh = conversationRefreshAtRef.current.get(conversationId) ?? 0;
         if (Date.now() - lastRefresh > 2_000) {
           conversationRefreshAtRef.current.set(conversationId, Date.now());
@@ -1504,77 +1406,49 @@ export function App() {
         return;
       }
       if (isOpen) markConversationReadThroughApplied(conversationId);
+    };
+
+    bindChannelMessageEvents(socket, user.id, {
+      canView: (channelId) => channelsRef.current.some((channel) => channel.id === channelId && channel.canView),
+      isSelected: (channelId) => selectedChannelIdRef.current === channelId,
+      apply: applyMessage,
+      remove: ({ scopeId, messageId, updatedSeq }) =>
+        removeRealtimeMessage(`${CHANNEL_SCOPE_PREFIX}${scopeId}`, messageId, updatedSeq),
+      markRead: markReadThroughAppliedMessages,
+      incrementUnread: (channelId) => setChannelUnreadCount(channelId, (unreadCountsRef.current[channelId] ?? 0) + 1),
+      setPinned: setRealtimePin
     });
-    socket.on("conversation:message:updated", (value: unknown) => {
-      const event = conversationMessageFromEvent(value);
-      if (!event) return;
-      applyMessage(event.message);
-    });
-    socket.on("conversation:message:deleted", (value: unknown) => {
-      const deleted = deletedConversationMessageFromEvent(value);
-      if (!deleted) return;
-      if (selectedConversationIdRef.current !== deleted.conversationId) return;
-      deletedMessageIdsRef.current.add(deleted.messageId);
-      observeMessageCursor(`${CONVERSATION_SCOPE_PREFIX}${deleted.conversationId}`, deleted.updatedSeq);
-      setMessages((current) => current.map((message) => message.id === deleted.messageId
-        ? { ...message, updatedSeq: deleted.updatedSeq, deleted: true, content: "", mentions: [] }
-        : message));
-    });
-    // Список переписок в двух формах: полный список (закрытие, изменение состава)
-    // и сигнал `conversations: null` после отключения участника.
-    socket.on("conversations:sync", (value: unknown) => {
-      if (!isRecord(value)) return;
-      if (value.conversations === null) {
-        void refreshConversations();
-        return;
+    bindConversationMessageEvents(socket, user.id, {
+      apply: applyMessage,
+      isSelected: (conversationId) => selectedConversationIdRef.current === conversationId,
+      onCreated: onConversationMessage,
+      remove: ({ scopeId, messageId, updatedSeq }) =>
+        removeRealtimeMessage(`${CONVERSATION_SCOPE_PREFIX}${scopeId}`, messageId, updatedSeq),
+      replaceConversations: applyConversations,
+      refreshConversations,
+      clearUnread: (conversationId) => setConversations((current) => current.map((conversation) =>
+        conversation.id === conversationId ? { ...conversation, unreadCount: 0 } : conversation)),
+      recordTyping: (conversationId, userId, login) => {
+        const entries = typingRef.current.get(conversationId) ?? new Map<string, { login: string; expiresAt: number }>();
+        entries.set(userId, { login, expiresAt: Date.now() + TYPING_TTL_MS });
+        typingRef.current.set(conversationId, entries);
+        setTypingVersion((current) => current + 1);
       }
-      if (!Array.isArray(value.conversations) || !value.conversations.every(isConversation)) return;
-      applyConversations(value.conversations);
-    });
-    // Прочтение на другом устройстве того же участника: гаснет только счётчик
-    // строки, открытая лента и курсор не двигаются.
-    socket.on("conversation:read", (value: unknown) => {
-      if (!isRecord(value) || typeof value.conversationId !== "string") return;
-      const conversationId = value.conversationId;
-      setConversations((current) => current.map((conversation) => conversation.id === conversationId
-        ? { ...conversation, unreadCount: 0 }
-        : conversation));
-    });
-    // Набор собеседника: сервер состояние не хранит, поэтому карта пополняется
-    // здесь и гаснет по TTL. Собственный `userId` игнорируется, а
-    // событие валидируется — подменить отображаемое имя нельзя.
-    socket.on(CONVERSATION_REALTIME.typing, (value: unknown) => {
-      if (!isRecord(value)) return;
-      const conversationId = value.conversationId;
-      const userId = value.userId;
-      const login = value.login;
-      if (typeof conversationId !== "string" || conversationId.length === 0) return;
-      if (typeof userId !== "string" || userId === user.id) return;
-      if (typeof login !== "string" || login.length === 0 || login.length > 64) return;
-      const entries = typingRef.current.get(conversationId) ?? new Map<string, { login: string; expiresAt: number }>();
-      entries.set(userId, { login, expiresAt: Date.now() + TYPING_TTL_MS });
-      typingRef.current.set(conversationId, entries);
-      setTypingVersion((current) => current + 1);
     });
     socket.on("connect_error", (error) => {
       setRealtimeStatus("disconnected");
-      updatePendingMessages((current) => current.map((message) =>
-        message.state === "sending" ? { ...message, state: "queued" } : message
-      ));
+      queueSendingMessages();
       if (error.message === "UNAUTHORIZED") invalidate();
     });
     socket.on("disconnect", (reason) => {
       setRealtimeStatus("disconnected");
-      channelSubscriptions.current.confirmed.clear();
-      channelSubscriptions.current.pending.clear();
+      clearChannelSubscriptions();
       // при разрыве связи индикатор пропадает сразу — состояние набора
       // восстановить нельзя, событий про «кто печатал» на сервере нет.
       typingRef.current.clear();
       typingSentAtRef.current.clear();
       setTypingVersion((current) => current + 1);
-      updatePendingMessages((current) => current.map((message) =>
-        message.state === "sending" ? { ...message, state: "queued" } : message
-      ));
+      queueSendingMessages();
       if (reason === "io server disconnect") invalidate();
     });
     socket.connect();
