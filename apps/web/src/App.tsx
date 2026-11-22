@@ -1807,22 +1807,24 @@ export function App() {
     if (screen === "guest") loginInput.current?.focus();
   }, [screen]);
 
-  const handleComposerSubmit = useCallback((content: string, token: string) => {
-    const channelId = selectedChannelIdRef.current;
-    if (!channelId) return;
+  function handleComposerSubmit(scope: "channel" | "conversation", content: string, token: string): void {
+    const { id, prefix, send } = scope === "channel"
+      ? { id: selectedChannelIdRef.current, prefix: CHANNEL_SCOPE_PREFIX, send: submitPendingMessage }
+      : { id: selectedConversationIdRef.current, prefix: CONVERSATION_SCOPE_PREFIX, send: submitConversationMessage };
+    if (!id) return;
     setMessageInput("");
     const clientRequestId = createClientRequestId();
     if (realtimeStatus !== "connected" || !realtimeSocket.current?.connected) {
       updatePendingMessages((current) => [...current, {
-        scopeKey: `${CHANNEL_SCOPE_PREFIX}${channelId}`,
+        scopeKey: `${prefix}${id}`,
         content,
         clientRequestId,
         state: "queued"
       }]);
       return;
     }
-    void submitPendingMessage(channelId, content, clientRequestId, token);
-  }, [realtimeStatus, submitPendingMessage, updatePendingMessages]);
+    void send(id, content, clientRequestId, token);
+  }
 
   const handleRetryMessage = useCallback((clientRequestId: string) => {
     const message = pendingMessages.find((entry) => entry.clientRequestId === clientRequestId);
@@ -1837,23 +1839,6 @@ export function App() {
     if (channelId === null) return;
     void submitPendingMessage(channelId, message.content, message.clientRequestId, csrfToken);
   }, [pendingMessages, csrfToken, realtimeStatus, submitPendingMessage, updatePendingMessages]);
-
-  const handleConversationComposerSubmit = useCallback((content: string, token: string) => {
-    const conversationId = selectedConversationIdRef.current;
-    if (!conversationId) return;
-    setMessageInput("");
-    const clientRequestId = createClientRequestId();
-    if (realtimeStatus !== "connected" || !realtimeSocket.current?.connected) {
-      updatePendingMessages((current) => [...current, {
-        scopeKey: `${CONVERSATION_SCOPE_PREFIX}${conversationId}`,
-        content,
-        clientRequestId,
-        state: "queued"
-      }]);
-      return;
-    }
-    void submitConversationMessage(conversationId, content, clientRequestId, token);
-  }, [realtimeStatus, submitConversationMessage, updatePendingMessages]);
 
   const retryConversationMessage = useCallback((clientRequestId: string) => {
     const message = pendingMessages.find((entry) => entry.clientRequestId === clientRequestId);
@@ -2783,7 +2768,7 @@ export function App() {
                           onInput={() => {
                             if (selectedConversationId) emitTyping(selectedConversationId);
                           }}
-                          onSubmit={handleConversationComposerSubmit}
+                          onSubmit={(content, token) => handleComposerSubmit("conversation", content, token)}
                           disabled={false}
                           offline={realtimeStatus !== "connected"}
                           csrfToken={csrfToken}
@@ -2874,7 +2859,7 @@ export function App() {
                       <MessageComposer
                         value={messageInput}
                         onChange={setMessageInput}
-                        onSubmit={handleComposerSubmit}
+                        onSubmit={(content, token) => handleComposerSubmit("channel", content, token)}
                         disabled={!selectedChannel.canSend}
                         {...(!selectedChannel.canSend ? { disabledReason: "канал только для чтения" } : {})}
                         offline={realtimeStatus !== "connected"}
