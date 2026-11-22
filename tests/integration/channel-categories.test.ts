@@ -598,7 +598,9 @@ if (!inContainer) {
       ...currentCategories.map((category) => category.id).filter((id) => !createdIds.has(id))
     ];
     const path = "/api/channels/categories/order";
+    const csrfMissing: HttpSession = managerSession.cookie ? { cookie: managerSession.cookie } : {};
 
+    await expectError(await request(csrfMissing, path, "PUT", { categoryIds: requested }), 403, "CSRF_FAILED");
     const reordered = await request(managerSession, path, "PUT", { categoryIds: requested });
     expect(reordered.status, await reordered.text()).toBe(204);
     const positions = await pool.query<{ id: string; position: number }>(
@@ -676,6 +678,8 @@ if (!inContainer) {
         ...uncategorizedGroup.channelIds.filter((id) => id !== uncategorizedFirstId && id !== uncategorizedSecondId)
       ];
 
+      const csrfMissing: HttpSession = managerSession.cookie ? { cookie: managerSession.cookie } : {};
+      await expectError(await request(csrfMissing, path, "PUT", { groups }), 403, "CSRF_FAILED");
       const reordered = await request(managerSession, path, "PUT", { groups });
       expect(reordered.status, await reordered.text()).toBe(204);
 

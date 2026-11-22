@@ -76,6 +76,7 @@ import { SettingsModal, type SettingsSection } from "./components/SettingsModal"
 import type { ReorderDropTarget, ReorderItem } from "./components/useDragReorder";
 import { useTheme } from "./hooks/useTheme";
 import { useTimezone } from "./hooks/useTimezone";
+import { reorderChannel, swapCategories } from "./lib/channelOrder";
 import { CHANNEL_REALTIME, CONVERSATION_REALTIME, MESSAGE_REALTIME, connectRealtime, type RealtimeStatus } from "./realtime";
 
 type ScreenState = "loading" | "guest" | "authenticated";
@@ -2178,32 +2179,34 @@ export function App() {
     replaceUnreadCounts(channelData.channels, true);
   }
 
-  async function handleReorderCategory(categoryId: string, direction: -1 | 1): Promise<void> {
-    if (isReorderingCategories || orderSaveInFlightRef.current) return;
-    const current = categories;
-    const index = current.findIndex((category) => category.id === categoryId);
-    const destination = index + direction;
-    if (index < 0 || destination < 0 || destination >= current.length) return;
-    if (!csrfToken) {
-      setErrorMessage("Не удалось сохранить порядок. Попробуйте ещё раз.");
-      return;
-    }
-
-    const next = [...current];
-    [next[index], next[destination]] = [next[destination]!, next[index]!];
-    setCategories(next);
-    setErrorMessage(null);
+  async function saveCategoryOrder(next: ChannelCategory[], token: string, announcement?: string): Promise<void> {
     orderSaveInFlightRef.current = true;
+    setCategories(next);
     setIsReorderingCategories(true);
     try {
-      await reorderCategoriesRequest(next.map((category) => category.id), csrfToken);
+      await reorderCategoriesRequest(next.map((category) => category.id), token);
+      if (announcement) setDragAnnouncement(announcement);
     } catch {
-      setCategories(current);
+      setCategories(categories);
       setErrorMessage("Не удалось сохранить порядок. Попробуйте ещё раз.");
     } finally {
       orderSaveInFlightRef.current = false;
       setIsReorderingCategories(false);
     }
+  }
+
+  async function handleReorderCategory(categoryId: string, direction: -1 | 1): Promise<void> {
+    if (isReorderingCategories || orderSaveInFlightRef.current) return;
+    const index = categories.findIndex((category) => category.id === categoryId);
+    const next = swapCategories(categories, index, index + direction);
+    if (!next) return;
+    if (!csrfToken) {
+      setErrorMessage("Не удалось сохранить порядок. Попробуйте ещё раз.");
+      return;
+    }
+
+    setErrorMessage(null);
+    await saveCategoryOrder(next, csrfToken);
   }
 
   async function handleReorderItem(item: ReorderItem, target: ReorderDropTarget): Promise<void> {
@@ -2215,88 +2218,31 @@ export function App() {
 
     setDragAnnouncement("");
     setErrorMessage(null);
-    orderSaveInFlightRef.current = true;
 
     if (item.kind === "category") {
-      if (target.type !== "category" || target.categoryId === null) {
-        orderSaveInFlightRef.current = false;
-        return;
-      }
-      const previous = categories;
-      const sourceIndex = previous.findIndex((category) => category.id === item.id);
-      const targetIndex = previous.findIndex((category) => category.id === target.categoryId);
-      if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) {
-        orderSaveInFlightRef.current = false;
-        return;
-      }
-
-      const next = [...previous];
-      [next[sourceIndex], next[targetIndex]] = [next[targetIndex]!, next[sourceIndex]!];
-      setCategories(next);
-      setIsReorderingCategories(true);
-      try {
-        await reorderCategoriesRequest(next.map((category) => category.id), csrfToken);
-        const movedCategory = next[targetIndex];
-        if (movedCategory) setDragAnnouncement(`Категория «${movedCategory.name}» перемещена на позицию ${targetIndex + 1}.`);
-      } catch {
-        setCategories(previous);
-        setErrorMessage("Не удалось сохранить порядок. Попробуйте ещё раз.");
-      } finally {
-        orderSaveInFlightRef.current = false;
-        setIsReorderingCategories(false);
+      const sourceIndex = categories.findIndex((category) => category.id === item.id);
+      const targetIndex = target.type === "category"
+        ? categories.findIndex((category) => category.id === target.categoryId)
+        : -1;
+      const next = swapCategories(categories, sourceIndex, targetIndex);
+      if (next) {
+        const announcement = `Категория «${next[targetIndex]!.name}» перемещена на позицию ${targetIndex + 1}.`;
+        await saveCategoryOrder(next, csrfToken, announcement);
       }
       return;
     }
 
     const previous = channelsRef.current;
-    const source = previous.find((channel) => channel.id === item.id);
-    if (!source) {
-      orderSaveInFlightRef.current = false;
-      return;
-    }
-    const categoryIds: Array<string | null> = [null, ...categories.map((category) => category.id)];
-    const grouped = new Map<string | null, Channel[]>(categoryIds.map((categoryId) => [categoryId, []]));
-    for (const channel of previous) {
-      const group = grouped.get(channel.categoryId);
-      if (group) group.push(channel);
-    }
-    const sourceGroup = grouped.get(source.categoryId);
-    const targetGroup = grouped.get(target.categoryId);
-    if (!sourceGroup || !targetGroup) {
-      orderSaveInFlightRef.current = false;
-      return;
-    }
-    const sourceIndex = sourceGroup.findIndex((channel) => channel.id === source.id);
-    if (sourceIndex < 0) {
-      orderSaveInFlightRef.current = false;
-      return;
-    }
-    sourceGroup.splice(sourceIndex, 1);
-    const moved = { ...source, categoryId: target.categoryId };
-    if (target.type === "channel") {
-      const targetIndex = targetGroup.findIndex((channel) => channel.id === target.channelId);
-      if (targetIndex < 0) {
-        orderSaveInFlightRef.current = false;
-        return;
-      }
-      targetGroup.splice(targetIndex + (target.position === "after" ? 1 : 0), 0, moved);
-    } else {
-      targetGroup.push(moved);
-    }
+    const next = reorderChannel(previous, categories, item.id, target);
+    if (!next) return;
 
-    const nextChannels = categoryIds.flatMap((categoryId) => grouped.get(categoryId) ?? []);
-    const groups = categoryIds.map((categoryId) => ({
-      categoryId,
-      channelIds: (grouped.get(categoryId) ?? []).map((channel) => channel.id)
-    }));
-    channelsRef.current = nextChannels;
-    setChannels(nextChannels);
+    orderSaveInFlightRef.current = true;
+    channelsRef.current = next.channels;
+    setChannels(next.channels);
     try {
-      await reorderChannelsRequest(groups, csrfToken);
-      const targetCategoryName = target.categoryId === null
-        ? "Без категории"
-        : categories.find((category) => category.id === target.categoryId)?.name ?? "Без категории";
-      setDragAnnouncement(`Канал «${source.name}» перемещён в категорию «${targetCategoryName}».`);
+      await reorderChannelsRequest(next.groups, csrfToken);
+      const targetCategoryName = categories.find((category) => category.id === target.categoryId)?.name ?? "Без категории";
+      setDragAnnouncement(`Канал «${next.movedChannel.name}» перемещён в категорию «${targetCategoryName}».`);
     } catch {
       channelsRef.current = previous;
       setChannels(previous);

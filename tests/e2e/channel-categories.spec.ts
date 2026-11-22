@@ -356,18 +356,54 @@ test.describe("channel categories", () => {
     await page.reload();
     await expect(page.locator(".app-shell")).toBeVisible();
 
-    const channelFrom = page.locator(
-      `.channel-category[data-category-id="__uncategorized__"] [data-channel-id="${movingChannel.id}"] .channel-drag-handle`
+    const uncategorizedChannel = page.locator(
+      `.channel-category[data-category-id="__uncategorized__"] [data-channel-id="${movingChannel.id}"]`
     );
+    const channelFrom = uncategorizedChannel.locator(".channel-drag-handle");
     const categoryTarget = page.locator(`.channel-category[data-category-id="${targetCategory.id}"] .channel-category-header`);
+    const movedChannel = page.locator(
+      `.channel-category[data-category-id="${targetCategory.id}"] [data-channel-id="${movingChannel.id}"]`
+    );
+    const orderRoutes = (url: URL) => ["/api/channels/order", "/api/channels/categories/order"].includes(url.pathname);
+    const requestedOrders: string[] = [];
+    let releaseOrder!: () => void;
+    const heldOrder = new Promise<void>((resolve) => { releaseOrder = resolve; });
+    await page.route(orderRoutes, async (route) => {
+      const request = route.request();
+      const path = new URL(request.url()).pathname;
+      if (request.method() === "PUT") requestedOrders.push(path);
+      if (request.method() !== "PUT" || path !== "/api/channels/order") {
+        await route.continue();
+        return;
+      }
+      await heldOrder;
+      await route.fulfill({ status: 500, json: { error: { code: "INTERNAL", message: "ошибка" } } });
+    });
+    try {
+      await dragWithPointer(page, channelFrom, categoryTarget);
+      await expect(movedChannel).toBeVisible();
+      await expect.poll(() => requestedOrders).toEqual(["/api/channels/order"]);
+
+      await page.getByRole("button", { name: `Действия с категорией «${targetCategory.name}»` }).click();
+      const categoryMenu = page.getByRole("menu", { name: `Действия с категорией «${targetCategory.name}»` });
+      await categoryMenu.getByRole("menuitem", { name: "Переместить ниже" }).press("Enter");
+      await expect(categoryMenu).toHaveCount(0);
+
+      releaseOrder();
+      await expect(page.getByRole("alert").filter({ hasText: "Не удалось сохранить порядок. Попробуйте ещё раз." })).toBeVisible();
+      await expect(uncategorizedChannel).toBeVisible();
+      expect(requestedOrders).toEqual(["/api/channels/order"]);
+    } finally {
+      releaseOrder();
+      await page.unroute(orderRoutes);
+    }
+
     const channelOrderResponse = page.waitForResponse((response) =>
       new URL(response.url()).pathname === "/api/channels/order" && response.request().method() === "PUT"
     );
     await dragWithPointer(page, channelFrom, categoryTarget);
     expect((await channelOrderResponse).status()).toBe(204);
-    await expect(page.locator(
-      `.channel-category[data-category-id="${targetCategory.id}"] [data-channel-id="${movingChannel.id}"]`
-    )).toBeVisible();
+    await expect(movedChannel).toBeVisible();
 
     await page.reload();
     await expect(page.locator(
