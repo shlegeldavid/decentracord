@@ -302,11 +302,13 @@ test.describe("channel categories", () => {
       .evaluateAll((nodes) => nodes.map((node) => node.textContent?.trim()))).toEqual(expectedNames);
 
     const settings = page.locator(".settings-modal");
-    await page.getByRole("button", { name: "Создать категорию" }).within(settings).click();
+    const createCategory = page.getByRole("button", { name: "Создать категорию" }).within(settings);
+    await createCategory.click();
     const createDialog = page.getByRole("dialog", { name: "Создать категорию" });
     await expect(createDialog).toBeVisible();
     await expect(page.getByLabel("Название категории").within(createDialog)).toBeVisible();
     await page.getByRole("button", { name: "Отмена" }).within(createDialog).click();
+    await expect(createCategory).toBeFocused();
   });
 
   test("reorders channels and categories with pointer handles and persists the full order", async ({ browser, page, identity }) => {
