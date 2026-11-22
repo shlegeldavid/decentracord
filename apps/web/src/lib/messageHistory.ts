@@ -29,6 +29,15 @@ export function withoutDeletedContent(message: MessageView): MessageView {
   return { ...message, deleted: true, content: "", mentions: [] };
 }
 
+export function mergeHistoryEvent(current: MessageView[], message: MessageView, deletedIds: ReadonlySet<string>): MessageView[] {
+  const existing = current.find((entry) => entry.id === message.id);
+  if (!message.deleted && (deletedIds.has(message.id) || (existing && message.updatedSeq <= existing.updatedSeq))) {
+    return current;
+  }
+  const others = current.filter((entry) => entry.id !== message.id && entry.clientRequestId !== message.clientRequestId);
+  return [...others, message.deleted ? withoutDeletedContent(message) : message].sort(compareMessageOrder);
+}
+
 export function mergeHistoryPage(
   current: MessageView[],
   scopeKey: ScopeKey,
