@@ -300,6 +300,40 @@ test.describe("personal messages in the sidebar", () => {
         await expect(menu.getByRole("menuitem", { name: "Закрепить" })).toHaveCount(0);
         await author.page.keyboard.press("Escape");
         await expect(menu).toHaveCount(0);
+
+        const retryMessage = "Личное сообщение с повторной отправкой";
+        const requestIds: string[] = [];
+        await author.page.route(/\/api\/conversations\/[^/]+\/messages$/u, async (route) => {
+          const request = route.request();
+          if (request.method() === "POST") {
+            const { content, clientRequestId } = request.postDataJSON() as { content: string; clientRequestId: string };
+            if (content === retryMessage) {
+              requestIds.push(clientRequestId);
+              if (requestIds.length === 1) {
+                await route.fulfill({ status: 503, json: { error: { code: "UNAVAILABLE", message: "Сервис недоступен" } } });
+                return;
+              }
+            }
+          }
+          await route.continue();
+        });
+        await sendMessage(author.page, retryMessage);
+        const pending = messageRow(author.page, retryMessage);
+        await expect(pending).toHaveClass(/\bfailed\b/u);
+        await expect(pending).toHaveAttribute("data-client-request-id", /.+/u);
+        const clientRequestId = await pending.getAttribute("data-client-request-id");
+        await expect(messageRow(peer.page, retryMessage)).toHaveCount(0);
+        await pending.getByRole("button", { name: "Повторить", exact: true }).click();
+        await expect(messageRow(author.page, retryMessage)).toHaveAttribute("data-message-id", /.+/u);
+        await expect(messageRow(peer.page, retryMessage)).toHaveCount(1);
+        expect(requestIds).toEqual([clientRequestId, clientRequestId]);
+
+        await author.context.setOffline(true);
+        await expect(author.page.locator(".connection-status")).toContainText("нет связи", { timeout: 15_000 });
+        const queuedMessage = "Личное сообщение без связи";
+        await sendMessage(author.page, queuedMessage);
+        await expect(messageRow(author.page, queuedMessage)).toContainText("В очереди");
+        await expect(messageRow(peer.page, queuedMessage)).toHaveCount(0);
       } finally {
         await peer.context.close();
       }

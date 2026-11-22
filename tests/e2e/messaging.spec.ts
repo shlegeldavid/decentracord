@@ -257,6 +257,13 @@ test.describe("channel messaging and reconnection", () => {
         const container = element as HTMLElement;
         return container.scrollHeight - container.scrollTop - container.clientHeight;
       });
+      const queuedRequestIds: Array<string | null> = [];
+      const sentRequestIds: string[] = [];
+      manager.page.on("request", (request) => {
+        if (request.method() !== "POST" || new URL(request.url()).pathname !== `/api/channels/${channel.id}/messages`) return;
+        const { clientRequestId } = request.postDataJSON() as { clientRequestId: string };
+        sentRequestIds.push(clientRequestId);
+      });
 
       await manager.context.setOffline(true);
       await expect(manager.page.locator(".connection-status")).toContainText("нет связи", { timeout: 15_000 });
@@ -265,8 +272,12 @@ test.describe("channel messaging and reconnection", () => {
         await manager.page.getByLabel("Сообщение").fill(queuedMessage);
         await manager.page.getByRole("button", { name: "Отправить", exact: true }).click();
         await expect(feed.locator(".message-pending")).toHaveCount(index + 1);
+        const pending = feed.locator(".message-pending").filter({ hasText: queuedMessage });
+        await expect(pending).toHaveAttribute("data-client-request-id", /.+/u);
+        queuedRequestIds.push(await pending.getAttribute("data-client-request-id"));
       }
       await expect.poll(distanceFromLatest).toBeLessThanOrEqual(2);
+      expect(sentRequestIds).toEqual([]);
 
       await sendFromComposer(member.page, reconnectMessage);
       await expect(messageWithText(manager.page, reconnectMessage)).toHaveCount(0, { timeout: 500 });
@@ -274,6 +285,8 @@ test.describe("channel messaging and reconnection", () => {
       await expect(manager.page.locator(".connection-status")).toContainText("подключено", { timeout: 15_000 });
       await expect(feed.locator(".message-pending")).toHaveCount(0);
       await expect(feed.locator("[data-message-id]")).toHaveCount(4);
+      expect(new Set(queuedRequestIds).size).toBe(3);
+      expect(sentRequestIds).toEqual(queuedRequestIds);
       const recoveredMessage = messageWithText(manager.page, reconnectMessage);
       await expect(recoveredMessage).toHaveCount(1);
       await expect(recoveredMessage).toHaveAttribute("data-message-id", /.+/u);
