@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { FormEvent } from "react";
 import {
   ApiError,
   closeConversation,
@@ -8,23 +7,16 @@ import {
   deleteMessage,
   editConversationMessage,
   editMessage,
-  getCsrfToken,
-  getCurrentUser,
   getChannels,
-  getOrganization,
   listConversations,
   markConversationRead,
-  logout,
-  login,
   markChannelRead,
   sendConversationMessage,
   sendMessage,
-  type AuthUser,
   type Channel,
   type ChannelCategory,
   type Conversation,
-  type MessageView,
-  type Organization
+  type MessageView
 } from "./api";
 import type { PendingMessage } from "./components/MessageFeed";
 import { ChannelMembersPanel } from "./components/ChannelMembersPanel";
@@ -42,6 +34,7 @@ import { useChannelPins } from "./hooks/useChannelPins";
 import { useMessageHistoryPaging, useMessageHistoryState, type ApplyMessageOptions } from "./hooks/useMessageHistory";
 import { useTheme } from "./hooks/useTheme";
 import { useTimezone } from "./hooks/useTimezone";
+import { useWorkspaceSession, type WorkspaceBootstrap } from "./hooks/useWorkspaceSession";
 import {
   CHANNEL_SCOPE_PREFIX,
   CONVERSATION_SCOPE_PREFIX,
@@ -53,7 +46,6 @@ import { CONVERSATION_REALTIME, connectRealtime, type RealtimeStatus } from "./r
 import { bindChannelMessageEvents, bindConversationMessageEvents } from "./realtimeMessageEvents";
 import { bindChannelEvents, bindSessionEvents, subscribeToReadableChannels, type ChannelSubscriptions } from "./realtimeWorkspaceEvents";
 
-type ScreenState = "loading" | "guest" | "authenticated";
 type WorkspaceOverlay = "channels" | "members" | null;
 type LocalPendingMessage = Omit<PendingMessage, "state"> & { state: PendingMessage["state"] };
 type RevokedChannel = { id: string; reason: string };
@@ -124,13 +116,6 @@ function readInitialDmCollapsed(): boolean {
   }
 }
 
-function guestError(error: unknown): string {
-  if (error instanceof ApiError && error.status === 401) {
-    return "Неверный логин или пароль.";
-  }
-  return "Не удалось завершить вход. Попробуйте ещё раз.";
-}
-
 function rejectedSendReason(error: unknown): string {
   if (!(error instanceof ApiError)) return "Отправка отклонена.";
   if (error.code === "SEND_NOT_ALLOWED") return "В этом канале запрещена отправка сообщений.";
@@ -168,12 +153,8 @@ function createClientRequestId(): string {
 }
 
 export function App() {
-  const [screen, setScreen] = useState<ScreenState>("loading");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("account");
-  const [csrfToken, setCsrfToken] = useState<string | null>(null);
-  const [user, setUser] = useState<AuthUser | null>(null);
-  const [organization, setOrganization] = useState<Organization | null>(null);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [categories, setCategories] = useState<ChannelCategory[]>([]);
   const [dmMenu, setDmMenu] = useState<OpenDmMenu | null>(null);
@@ -208,17 +189,8 @@ export function App() {
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [messageInput, setMessageInput] = useState("");
   const [messageError, setMessageError] = useState<string | null>(null);
-  const [isAdministrator, setIsAdministrator] = useState(false);
-  const [canManageRoles, setCanManageRoles] = useState(false);
-  const [loginValue, setLoginValue] = useState("");
-  const [password, setPassword] = useState("");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [isLoggingOut, setIsLoggingOut] = useState(false);
   const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>("connecting");
-  const { theme, setTheme, toggleTheme } = useTheme(user, csrfToken);
-  const { timeZone, dayKey, formatMessageTime } = useTimezone(user);
   const appShellElementRef = useRef<HTMLElement | null>(null);
   const dmMenuRef = useRef<HTMLDivElement | null>(null);
   const overlayPanelRef = useRef<HTMLElement | null>(null);
@@ -227,7 +199,6 @@ export function App() {
     appShellElementRef.current = element;
     element?.style.setProperty("--sidebar-width", sidebarCollapsed ? "48px" : `${sidebarWidth}px`);
   }, [sidebarCollapsed, sidebarWidth]);
-  const loginInput = useRef<HTMLInputElement>(null);
   const realtimeSocket = useRef<ReturnType<typeof connectRealtime> | null>(null);
   const channelsRef = useRef<Channel[]>([]);
   const selectedChannelIdRef = useRef<string | null>(null);
@@ -248,11 +219,6 @@ export function App() {
   // Счётчик изменений карты набора: `Map` мутируется в обработчике ради
   // отсутствия лишних состояний, а перерисовку запрашивает версия.
   const [typingVersion, setTypingVersion] = useState(0);
-  const canManageChannels = Boolean(user && (
-    user.isOwner ||
-    user.permissions.includes("MANAGE_CHANNELS") ||
-    user.permissions.includes("ADMINISTRATOR")
-  ));
   const selectedChannel = revokedChannel?.id === selectedChannelId
     ? selectedChannelSnapshotRef.current
     : channels.find((channel) => channel.id === selectedChannelId) ?? null;
@@ -325,6 +291,77 @@ export function App() {
     unreadCountsRef.current = next;
     setUnreadCounts(next);
   }, []);
+
+  const applyWorkspaceBootstrap = useCallback((data: WorkspaceBootstrap | null) => {
+    if (data) {
+      setCollapsedCategoryIds(readInitialCollapsedCategories(data.user.id));
+      setUncategorizedCollapsed(readInitialUncategorizedCollapsed(data.user.id));
+      if (data.conversations !== undefined) {
+        setDmCollapsed(readInitialDmCollapsed());
+        setConversations(data.conversations ?? []);
+        setConversationsStatus(data.conversations === null ? "error" : "ready");
+      }
+    }
+    const items = data?.channelData.channels ?? [];
+    channelsRef.current = items;
+    replaceUnreadCounts(items, false);
+    setChannels(items);
+    setCategories(data?.channelData.categories ?? []);
+    setSelectedChannelId(null);
+  }, [replaceUnreadCounts]);
+
+  const clearWorkspace = useCallback(() => {
+    realtimeSocket.current?.disconnect();
+    realtimeSocket.current = null;
+    setAccessDeniedChannelId(null);
+    setExpandedChannelTopicId(null);
+    selectedChannelIdRef.current = null;
+    selectedConversationIdRef.current = null;
+    selectedChannelSnapshotRef.current = null;
+    revokedChannelRef.current = null;
+    setRevokedChannel(null);
+    resetHistory();
+    setChannelLastReadSeq(undefined);
+    setPendingMessages([]);
+    pendingMessagesRef.current = [];
+    setConversations([]);
+    setConversationsStatus("loading");
+    setSelectedConversationId(null);
+    setCreateDmOpen(false);
+    setAddDmMembersOpen(false);
+    setDmMenu(null);
+    setHiddenConversationId(null);
+    setHiddenConversationSnapshot(null);
+    setDmAnnouncement("");
+    setDmMembersAnnouncement("");
+    conversationsRef.current = [];
+    conversationRefreshAtRef.current.clear();
+    // На экране входа заголовок вкладки не показывает непрочитанные сообщения.
+    document.title = "Decentracord";
+    setMessageInput("");
+    setMessageError(null);
+    channelSubscriptions.current.clear();
+    typingRef.current.clear();
+    typingSentAtRef.current.clear();
+    setTypingVersion((value) => value + 1);
+    setSettingsOpen(false);
+    setSettingsSection("account");
+    setOpenOverlay(null);
+    setChannelPropertiesTarget(null);
+    setRealtimeStatus("disconnected");
+  }, [resetHistory]);
+
+  const {
+    screen, user, organization, csrfToken, loginValue, setLoginValue, submitLogin, handleLogout,
+    handlePasswordChanged, isSubmitting, isLoggingOut, successMessage, clearPrivateSession,
+    updateUser, updateOrganizationName, refreshOrganization, isAdministrator, canManageRoles, canManageChannels
+  } = useWorkspaceSession({
+    applyBootstrap: applyWorkspaceBootstrap,
+    clearWorkspace,
+    onError: setErrorMessage
+  });
+  const { theme, setTheme, toggleTheme } = useTheme(user, csrfToken);
+  const { timeZone, dayKey, formatMessageTime } = useTimezone(user);
 
   const toggleCategoryCollapsed = useCallback((categoryId: string) => {
     if (!user) return;
@@ -413,62 +450,6 @@ export function App() {
   useEffect(() => {
     if (!selectedChannelId) setChannelLastReadSeq(undefined);
   }, [selectedChannelId]);
-
-  const clearPrivateSession = useCallback(() => {
-    realtimeSocket.current?.disconnect();
-    realtimeSocket.current = null;
-    setUser(null);
-    setOrganization(null);
-    setChannels([]);
-    setCategories([]);
-    channelsRef.current = [];
-    setSelectedChannelId(null);
-    setAccessDeniedChannelId(null);
-    setExpandedChannelTopicId(null);
-    selectedChannelIdRef.current = null;
-    selectedConversationIdRef.current = null;
-    selectedChannelSnapshotRef.current = null;
-    revokedChannelRef.current = null;
-    setRevokedChannel(null);
-    resetHistory();
-    setChannelLastReadSeq(undefined);
-    setPendingMessages([]);
-    pendingMessagesRef.current = [];
-    unreadCountsRef.current = {};
-    setUnreadCounts({});
-    setConversations([]);
-    setConversationsStatus("loading");
-    setSelectedConversationId(null);
-    setCreateDmOpen(false);
-    setAddDmMembersOpen(false);
-    setDmMenu(null);
-    setHiddenConversationId(null);
-    setHiddenConversationSnapshot(null);
-    setDmAnnouncement("");
-    setDmMembersAnnouncement("");
-    conversationsRef.current = [];
-    conversationRefreshAtRef.current.clear();
-    // На экране входа заголовок вкладки не показывает непрочитанные сообщения.
-    document.title = "Decentracord";
-    setMessageInput("");
-    setMessageError(null);
-    channelSubscriptions.current.clear();
-    typingRef.current.clear();
-    typingSentAtRef.current.clear();
-    setTypingVersion((value) => value + 1);
-    setIsAdministrator(false);
-    setCanManageRoles(false);
-    setSettingsOpen(false);
-    setSettingsSection("account");
-    setOpenOverlay(null);
-    setChannelPropertiesTarget(null);
-    setPassword("");
-    setErrorMessage(null);
-    setSuccessMessage(null);
-    setRealtimeStatus("disconnected");
-    setScreen("guest");
-    void getCsrfToken().then(setCsrfToken).catch(() => setCsrfToken(null));
-  }, [resetHistory]);
 
   const channelPins = useChannelPins({
     channelId: selectedChannelId,
@@ -997,85 +978,6 @@ export function App() {
     subscribeToChannels(channels);
   }, [channels, screen, user, subscribeToChannels]);
 
-  useEffect(() => {
-    let active = true;
-
-    async function initialize(): Promise<void> {
-      try {
-        const token = await getCsrfToken();
-        if (!active) return;
-        setCsrfToken(token);
-
-        try {
-          const [currentUser, currentOrganization, channelData, conversationData] = await Promise.all([
-            getCurrentUser(),
-            getOrganization(),
-            getChannels(),
-            // Ошибка списка переписок не должна валить вход: раздел покажет
-            // собственное состояние ошибки.
-            listConversations().catch((): Conversation[] | null => null)
-          ]);
-          if (!active) return;
-          const currentChannels = channelData.channels;
-          setCollapsedCategoryIds(readInitialCollapsedCategories(currentUser.id));
-          setUncategorizedCollapsed(readInitialUncategorizedCollapsed(currentUser.id));
-          setDmCollapsed(readInitialDmCollapsed());
-          setUser(currentUser);
-          setOrganization(currentOrganization);
-          channelsRef.current = currentChannels;
-          replaceUnreadCounts(currentChannels, false);
-          setChannels(currentChannels);
-          setCategories(channelData.categories);
-          setConversations(conversationData ?? []);
-          setConversationsStatus(conversationData === null ? "error" : "ready");
-          setSelectedChannelId(null);
-          setIsAdministrator(currentUser.isOwner || currentUser.permissions.includes("ADMINISTRATOR"));
-          setCanManageRoles(
-            currentUser.permissions.includes("MANAGE_ROLES") || currentUser.permissions.includes("ADMINISTRATOR")
-          );
-          setScreen("authenticated");
-        } catch (error) {
-          if (!active) return;
-          setUser(null);
-          setOrganization(null);
-          channelsRef.current = [];
-          replaceUnreadCounts([], false);
-          setChannels([]);
-          setCategories([]);
-          setSelectedChannelId(null);
-          setIsAdministrator(false);
-          setCanManageRoles(false);
-          if (!(error instanceof ApiError && error.status === 401)) {
-            setErrorMessage("Не удалось загрузить данные установки. Обновите страницу и попробуйте снова.");
-          }
-          setScreen("guest");
-        }
-      } catch {
-        if (!active) return;
-        setUser(null);
-        setOrganization(null);
-        channelsRef.current = [];
-        replaceUnreadCounts([], false);
-        setChannels([]);
-        setCategories([]);
-        setSelectedChannelId(null);
-        setIsAdministrator(false);
-        setCanManageRoles(false);
-        setErrorMessage("Не удалось связаться с сервером. Проверьте подключение и повторите попытку.");
-        setScreen("guest");
-      }
-    }
-
-    void initialize();
-    return () => {
-      active = false;
-    };
-  }, [replaceUnreadCounts]);
-
-  useEffect(() => {
-    if (screen === "guest") loginInput.current?.focus();
-  }, [screen]);
-
   function handleComposerSubmit(kind: MessageScope, content: string, token: string): void {
     const id = (kind === "channel" ? selectedChannelIdRef : selectedConversationIdRef).current;
     if (!id) return;
@@ -1153,75 +1055,6 @@ export function App() {
     }
   }, [csrfToken, clearPrivateSession, markHistoryMessageDeleted]);
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
-    event.preventDefault();
-    setErrorMessage(null);
-    setSuccessMessage(null);
-    if (!csrfToken) {
-      setErrorMessage("Не удалось подготовить защищённый вход. Обновите страницу.");
-      return;
-    }
-
-    setIsSubmitting(true);
-    let credentialsAccepted = false;
-    try {
-      const nextCsrfToken = await login({ login: loginValue, password }, csrfToken);
-      setCsrfToken(nextCsrfToken);
-      credentialsAccepted = true;
-      const [currentUser, currentOrganization, channelData] = await Promise.all([
-        getCurrentUser(),
-        getOrganization(),
-        getChannels()
-      ]);
-      const currentChannels = channelData.channels;
-      setCollapsedCategoryIds(readInitialCollapsedCategories(currentUser.id));
-      setUncategorizedCollapsed(readInitialUncategorizedCollapsed(currentUser.id));
-      setUser(currentUser);
-      setOrganization(currentOrganization);
-      channelsRef.current = currentChannels;
-      replaceUnreadCounts(currentChannels, false);
-      setChannels(currentChannels);
-      setCategories(channelData.categories);
-      setSelectedChannelId(null);
-      setIsAdministrator(currentUser.isOwner || currentUser.permissions.includes("ADMINISTRATOR"));
-      setCanManageRoles(
-        currentUser.permissions.includes("MANAGE_ROLES") || currentUser.permissions.includes("ADMINISTRATOR")
-      );
-      setPassword("");
-      setScreen("authenticated");
-    } catch (error) {
-      setUser(null);
-      setOrganization(null);
-      channelsRef.current = [];
-      replaceUnreadCounts([], false);
-      setChannels([]);
-      setCategories([]);
-      setSelectedChannelId(null);
-      setIsAdministrator(false);
-      setCanManageRoles(false);
-      setScreen("guest");
-      if (credentialsAccepted) {
-        if (error instanceof ApiError && error.status === 401) {
-          setErrorMessage("Сессия завершилась. Войдите снова.");
-        } else {
-          setErrorMessage("Не удалось загрузить данные установки. Обновите страницу и попробуйте снова.");
-        }
-      } else {
-        setErrorMessage(guestError(error));
-      }
-
-      if (error instanceof ApiError && error.status === 403) {
-        try {
-          setCsrfToken(await getCsrfToken());
-        } catch {
-          setCsrfToken(null);
-        }
-      }
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
-
   // Меню строки диалога: единственный пункт «Закрыть переписку».
   function handleOpenDmMenu(conversationId: string, position: { x: number; y: number }): void {
     setDmMenu({
@@ -1283,53 +1116,13 @@ export function App() {
     });
   }
 
-  async function handleLogout(): Promise<void> {
-    if (!csrfToken) {
-      clearPrivateSession();
-      return;
-    }
-    setErrorMessage(null);
-    setIsLoggingOut(true);
-    try {
-      await logout(csrfToken);
-      clearPrivateSession();
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        clearPrivateSession();
-      } else {
-        setErrorMessage("Не удалось завершить сеанс. Попробуйте ещё раз.");
-      }
-    } finally {
-      setIsLoggingOut(false);
-    }
-  }
-
-  function handlePasswordChanged(): void {
-    clearPrivateSession();
-    setSuccessMessage("Пароль изменён. Войдите снова с новым паролем.");
-  }
-
-  if (screen === "loading") {
-    return (
-      <main className="page-shell">
-        <section className="status-card" aria-live="polite">
-          <span className="brand-mark" aria-hidden="true">D</span>
-          <p className="eyebrow">DECENTRACORD</p>
-          <p role="status" className="loading-copy">Проверяем доступ…</p>
-        </section>
-      </main>
-    );
-  }
-
   if (screen !== "authenticated" || !user || !organization || !csrfToken) {
     return (
       <LoginScreen
+        loading={screen === "loading"}
         loginValue={loginValue}
-        passwordValue={password}
         onLoginChange={setLoginValue}
-        onPasswordChange={setPassword}
-        onSubmit={(event) => void handleSubmit(event)}
-        loginInputRef={loginInput}
+        onSubmit={submitLogin}
         isSubmitting={isSubmitting}
         canSubmit={Boolean(csrfToken)}
         errorMessage={errorMessage}
@@ -1566,14 +1359,9 @@ export function App() {
         user={user}
         organizationName={organization.name}
         organizationLogoUrl={organization.logoUrl ?? null}
-        onOrganizationSaved={(name) => {
-          // Переименование не должно убирать логотип из шапки.
-          setOrganization((current) => current ? { ...current, name } : { name, logoUrl: null });
-        }}
-        onLogoChanged={() => {
-          void getOrganization().then(setOrganization).catch(() => undefined);
-        }}
-        onUserUpdated={setUser}
+        onOrganizationSaved={updateOrganizationName}
+        onLogoChanged={refreshOrganization}
+        onUserUpdated={updateUser}
         canManageRoles={canManageRoles}
         canManageChannels={canManageChannels}
         isAdministrator={isAdministrator}

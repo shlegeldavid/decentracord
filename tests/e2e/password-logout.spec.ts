@@ -62,6 +62,7 @@ test.describe("logout revokes only the current browser session", () => {
     expect(transportBodies.join("\n")).not.toMatch(/Организация|password_hash|csrfToken|e2e_admin/iu);
 
     const second = await newAuthenticatedPage(browser, identity.admin);
+    const renewCsrf = Promise.withResolvers<void>();
     try {
       await expect(second.page.getByRole("heading", { name: identity.organizationName })).toBeVisible();
       await expect(second.page.locator(".connection-status")).toContainText("подключено");
@@ -69,8 +70,19 @@ test.describe("logout revokes only the current browser session", () => {
       expect(sessionCookie).toBeTruthy();
       await context.storageState({ path: storageStatePath });
 
+      await page.route("**/api/auth/csrf", async (route) => {
+        await renewCsrf.promise;
+        await route.continue();
+      });
       await page.getByRole("button", { name: "Выйти" }).click();
       await expect(page.getByRole("heading", { name: "Вход" })).toBeVisible();
+      await expect(page.getByLabel("Логин")).toBeFocused();
+      await expect(page.getByLabel("Логин")).toHaveValue(identity.admin.login);
+      await expect(page.getByLabel("Пароль")).toHaveValue("");
+      const signIn = page.getByRole("button", { name: "Войти" });
+      await expect(signIn).toBeDisabled();
+      renewCsrf.resolve();
+      await expect(signIn).toBeEnabled();
       await expect(page.getByText(identity.organizationName, { exact: true })).toHaveCount(0);
       await expect(second.page.getByRole("heading", { name: identity.organizationName })).toBeVisible();
       await expect(second.page.locator(".connection-status")).toContainText("подключено");
@@ -83,6 +95,8 @@ test.describe("logout revokes only the current browser session", () => {
       expect(await staleCookieResponse.text()).not.toMatch(/Организация|password_hash/iu);
       expect((await context.request.get("/api/auth/me", { failOnStatusCode: false })).status()).toBe(401);
     } finally {
+      renewCsrf.resolve();
+      await page.unroute("**/api/auth/csrf");
       await second.context.close();
     }
   });
@@ -127,6 +141,7 @@ test.describe("logout revokes only the current browser session", () => {
       await first.page.getByRole("button", { name: "Сменить пароль" }).click();
 
       await expect(first.page.getByRole("heading", { name: "Вход" })).toBeVisible();
+      await expect(first.page.getByText("Пароль изменён. Войдите снова с новым паролем.")).toBeVisible();
       await expect(first.page.getByLabel("Пароль")).toHaveValue("");
       await expect(first.page.getByText(identity.organizationName, { exact: true })).toHaveCount(0);
       await expect(second.page.getByRole("heading", { name: "Вход" })).toBeVisible();
