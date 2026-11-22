@@ -8,22 +8,17 @@ import {
   deleteMessage,
   editConversationMessage,
   editMessage,
-  forwardMessageToChannel,
-  forwardMessageToConversation,
   getCsrfToken,
   getCurrentUser,
   getChannels,
   getOrganization,
-  getPinnedMessages,
   listConversations,
   markConversationRead,
   logout,
   login,
   markChannelRead,
-  pinMessage,
   sendConversationMessage,
   sendMessage,
-  unpinMessage,
   type AuthUser,
   type Channel,
   type ChannelCategory,
@@ -31,26 +26,19 @@ import {
   type MessageView,
   type Organization
 } from "./api";
-import { MessageComposer } from "./components/MessageComposer";
-import { ForwardMessageDialog } from "./components/ForwardMessageDialog";
-import { MessageFeed, type PendingMessage } from "./components/MessageFeed";
-import { MessageReadersModal } from "./components/MessageReadersModal";
-import { PinnedMessagesPanel } from "./components/PinnedMessagesPanel";
-import { RevokedAccessCard } from "./components/RevokedAccessCard";
+import type { PendingMessage } from "./components/MessageFeed";
 import { ChannelMembersPanel } from "./components/ChannelMembersPanel";
 import { WorkspaceChannelSidebar } from "./components/WorkspaceChannelSidebar";
+import { WorkspaceChatPane } from "./components/WorkspaceChatPane";
 import { CreateDmDialog } from "./components/CreateDmDialog";
 import { AddDmMembersDialog } from "./components/AddDmMembersDialog";
-import { DmHeader } from "./components/DmHeader";
-import { DmHiddenCard } from "./components/DmHiddenCard";
 import { DmMembersPanel } from "./components/DmMembersPanel";
 import { DmSection } from "./components/DmSection";
-import { TypingIndicator } from "./components/TypingIndicator";
 import { AppHeader } from "./components/AppHeader";
 import { PeopleSearch } from "./components/PeopleSearch";
-import { GearIcon } from "./components/icons";
 import { LoginScreen } from "./components/LoginScreen";
 import { SettingsModal, type SettingsSection } from "./components/SettingsModal";
+import { useChannelPins } from "./hooks/useChannelPins";
 import { useMessageHistoryPaging, useMessageHistoryState, type ApplyMessageOptions } from "./hooks/useMessageHistory";
 import { useTheme } from "./hooks/useTheme";
 import { useTimezone } from "./hooks/useTimezone";
@@ -220,16 +208,6 @@ export function App() {
   const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
   const [messageInput, setMessageInput] = useState("");
   const [messageError, setMessageError] = useState<string | null>(null);
-  const [readersMessage, setReadersMessage] = useState<{ channelId: string; messageId: string } | null>(null);
-  const [pinnedMessageIds, setPinnedMessageIds] = useState<Set<string>>(() => new Set());
-  const [pinsOpen, setPinsOpen] = useState(false);
-  // Цель пересылки: источник (канал или переписка) и само сообщение. Область
-  // источника едет вместе с ним — у переписки есть свой путь пересылки.
-  const [forwardTarget, setForwardTarget] = useState<{
-    source: { kind: "channel" | "conversation"; id: string };
-    message: MessageView;
-  } | null>(null);
-  const [forwardAnnouncement, setForwardAnnouncement] = useState("");
   const [isAdministrator, setIsAdministrator] = useState(false);
   const [canManageRoles, setCanManageRoles] = useState(false);
   const [loginValue, setLoginValue] = useState("");
@@ -257,9 +235,6 @@ export function App() {
   const conversationsRef = useRef<Conversation[]>([]);
   const selectedChannelSnapshotRef = useRef<Channel | null>(null);
   const revokedChannelRef = useRef<RevokedChannel | null>(null);
-  // Сообщение, к которому переходим после смены канала: оригинал пересланного
-  // сообщения может лежать в другом канале.
-  const pendingJumpMessageIdRef = useRef<string | null>(null);
   const pendingMessagesRef = useRef<LocalPendingMessage[]>([]);
   const unreadCountsRef = useRef<Record<string, number>>({});
   // Время последнего добора списка переписок по событию сообщения в конкретную
@@ -285,8 +260,6 @@ export function App() {
   // Переписка скрыта: строки в списке уже нет, но лента и история остаются.
   const isConversationHidden = hiddenConversationId !== null && selectedConversationId === hiddenConversationId;
   const openConversation = selectedConversation ?? (isConversationHidden ? hiddenConversationSnapshot : null);
-  const isSelectedChannelRevoked = revokedChannel?.id === selectedChannelId;
-  const canManageMessages = selectedChannel?.canManageMessages === true;
 
   const updatePendingMessages = useCallback((update: (current: LocalPendingMessage[]) => LocalPendingMessage[]) => {
     const next = update(pendingMessagesRef.current);
@@ -496,6 +469,15 @@ export function App() {
     setScreen("guest");
     void getCsrfToken().then(setCsrfToken).catch(() => setCsrfToken(null));
   }, [resetHistory]);
+
+  const channelPins = useChannelPins({
+    channelId: selectedChannelId,
+    selectedChannelId: selectedChannelIdRef,
+    csrfToken,
+    onError: setMessageError,
+    onSessionExpired: clearPrivateSession
+  });
+  const { setPinned } = channelPins;
 
   // Общий путь применения списка переписок: и полный ответ сервера, и добор по
   // сигналу `conversations: null`. Исчезновение открытой переписки — признак
@@ -932,15 +914,6 @@ export function App() {
       }
     }
 
-    const setRealtimePin = (messageId: string, pinned: boolean) => {
-      setPinnedMessageIds((current) => {
-        if (current.has(messageId) === pinned) return current;
-        const next = new Set(current);
-        if (pinned) next.add(messageId);
-        else next.delete(messageId);
-        return next;
-      });
-    };
     const onConversationMessage = (conversationId: string, message: MessageView) => {
       const isOpen = selectedConversationIdRef.current === conversationId;
       const known = conversationsRef.current.some((conversation) => conversation.id === conversationId);
@@ -974,7 +947,7 @@ export function App() {
         markHistoryMessageDeleted(messageId, { scopeKey: messageScopeKey("channel", scopeId), updatedSeq }),
       markRead: markReadThroughAppliedMessages,
       incrementUnread: (channelId) => setChannelUnreadCount(channelId, (unreadCountsRef.current[channelId] ?? 0) + 1),
-      setPinned: setRealtimePin
+      setPinned
     });
     bindConversationMessageEvents(socket, user.id, {
       apply: applyMessage,
@@ -1017,28 +990,7 @@ export function App() {
         realtimeSocket.current = null;
       }
     };
-  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUp, refreshConversations, csrfToken, replaceUnreadCounts, setChannelUnreadCount, submitScopedMessage, updatePendingMessages, markReadThroughAppliedMessages, markConversationReadThroughApplied, applyConversations, forgetChannelHistory, markHistoryMessageDeleted, resetHistoryStatus]);
-
-  // Закрепления канала: при смене канала множество очищается и загружается заново.
-  useEffect(() => {
-    const channelId = selectedChannelId;
-    setPinnedMessageIds(new Set());
-    setPinsOpen(false);
-    if (!channelId) return;
-    let active = true;
-    void getPinnedMessages(channelId)
-      .then((pins) => {
-        if (!active) return;
-        setPinnedMessageIds(new Set(pins.map((pin) => pin.messageId)));
-      })
-      .catch(() => {
-        if (!active) return;
-        setPinnedMessageIds(new Set());
-      });
-    return () => {
-      active = false;
-    };
-  }, [selectedChannelId]);
+  }, [screen, user, clearPrivateSession, subscribeToChannels, applyMessage, catchUp, refreshConversations, csrfToken, replaceUnreadCounts, setChannelUnreadCount, submitScopedMessage, updatePendingMessages, markReadThroughAppliedMessages, markConversationReadThroughApplied, applyConversations, forgetChannelHistory, markHistoryMessageDeleted, resetHistoryStatus, setPinned]);
 
   useEffect(() => {
     if (screen !== "authenticated" || !user) return;
@@ -1200,129 +1152,6 @@ export function App() {
         : apiError?.message ?? "Не удалось удалить сообщение.");
     }
   }, [csrfToken, clearPrivateSession, markHistoryMessageDeleted]);
-
-  const canEditMessage = useCallback((message: MessageView) => {
-    const createdAt = new Date(message.createdAt).getTime();
-    const age = Date.now() - createdAt;
-    return Number.isFinite(age) && age >= 0 && age < 3 * 24 * 60 * 60 * 1000;
-  }, []);
-
-  const openReaders = useCallback((channelId: string, messageId: string) => {
-    setReadersMessage({ channelId, messageId });
-  }, []);
-
-  // Пересылка в обе стороны: путь запроса выбирается по области
-  // источника, а цель — канал или переписка — приходит из диалога.
-  const handleForwardMessage = useCallback(async (target: { kind: "channel" | "conversation"; id: string }): Promise<void> => {
-    const pending = forwardTarget;
-    if (!pending || !csrfToken) throw new Error("Не удалось подготовить защищённый запрос");
-    try {
-      const message = target.kind === "channel"
-        ? await forwardMessageToChannel(pending.source, pending.message.id, target.id, csrfToken)
-        : await forwardMessageToConversation(pending.source, pending.message.id, target.id, csrfToken);
-      applyMessage(message);
-    } catch (error) {
-      // Истёкшая сессия: участник возвращается на экран входа, как и в остальных
-      // обработчиках сообщений.
-      if (error instanceof ApiError && error.status === 401) {
-        clearPrivateSession();
-      }
-      throw error;
-    }
-    setForwardTarget(null);
-    setForwardAnnouncement(
-      target.kind === "channel"
-        ? `Сообщение переслано в канал «${channels.find((channel) => channel.id === target.id)?.name ?? ""}».`
-        : "Сообщение переслано."
-    );
-  }, [channels, csrfToken, forwardTarget, clearPrivateSession, applyMessage]);
-
-  // Каналы, видимые участнику: по ним решается, строить ли ссылку на оригинал
-  // пересланного сообщения.
-  const visibleChannelIds = useMemo(
-    () => new Set(channels.filter((channel) => channel.canView).map((channel) => channel.id)),
-    [channels]
-  );
-
-  const handlePinMessage = useCallback(async (message: MessageView) => {
-    const channelId = selectedChannelIdRef.current;
-    if (!channelId || !csrfToken) return;
-    setMessageError(null);
-    try {
-      await pinMessage(channelId, message.id, csrfToken);
-      if (selectedChannelIdRef.current !== channelId) return;
-      setPinnedMessageIds((current) => {
-        if (current.has(message.id)) return current;
-        const next = new Set(current);
-        next.add(message.id);
-        return next;
-      });
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        clearPrivateSession();
-      } else if (selectedChannelIdRef.current === channelId) {
-        setMessageError(error instanceof ApiError ? error.message : "Не удалось закрепить сообщение.");
-      }
-    }
-  }, [csrfToken, clearPrivateSession]);
-
-  const handleUnpinMessage = useCallback(async (messageId: string) => {
-    const channelId = selectedChannelIdRef.current;
-    if (!channelId || !csrfToken) return;
-    setMessageError(null);
-    try {
-      await unpinMessage(channelId, messageId, csrfToken);
-      if (selectedChannelIdRef.current !== channelId) return;
-      setPinnedMessageIds((current) => {
-        if (!current.has(messageId)) return current;
-        const next = new Set(current);
-        next.delete(messageId);
-        return next;
-      });
-    } catch (error) {
-      if (error instanceof ApiError && error.status === 401) {
-        clearPrivateSession();
-      } else if (selectedChannelIdRef.current === channelId) {
-        setMessageError(error instanceof ApiError ? error.message : "Не удалось снять закрепление.");
-      }
-    }
-  }, [csrfToken, clearPrivateSession]);
-
-  // Переход к сообщению из панели закреплений: сообщения может не быть в
-  // загруженной истории ленты — тогда переход недоступен.
-  const jumpToPinnedMessage = useCallback((messageId: string): boolean => {
-    const article = Array.from(document.querySelectorAll<HTMLElement>(".message-feed [data-message-id]"))
-      .find((element) => element.dataset.messageId === messageId);
-    if (!article) return false;
-    const behavior = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
-    article.scrollIntoView({ behavior, block: "start" });
-    article.focus({ preventScroll: true });
-    return true;
-  }, []);
-
-  // Переход к оригиналу пересланного сообщения: если оригинал уже загружен в
-  // ленте — прокрутка к нему, иначе открываем канал-источник и переходим уже
-  // в нём.
-  const jumpToForwardedMessage = useCallback((messageId: string, channelId?: string): boolean => {
-    if (jumpToPinnedMessage(messageId)) {
-      pendingJumpMessageIdRef.current = null;
-      return true;
-    }
-    if (channelId && channelId !== selectedChannelIdRef.current) {
-      pendingJumpMessageIdRef.current = messageId;
-      selectChannel(channelId);
-    }
-    return false;
-  }, [jumpToPinnedMessage, selectChannel]);
-
-  // После смены канала оригинал может появиться в ленте с задержкой — переход
-  // к нему выполняется, как только сообщение загружено.
-  useEffect(() => {
-    const pendingMessageId = pendingJumpMessageIdRef.current;
-    if (!pendingMessageId) return;
-    if (!jumpToPinnedMessage(pendingMessageId)) return;
-    pendingJumpMessageIdRef.current = null;
-  }, [jumpToPinnedMessage, messages]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
@@ -1509,28 +1338,6 @@ export function App() {
     );
   }
 
-  const activeScope = openConversation
-    ? `${CONVERSATION_SCOPE_PREFIX}${openConversation.id}`
-    : selectedChannel ? `${CHANNEL_SCOPE_PREFIX}${selectedChannel.id}` : null;
-  const activePending = pendingMessages.filter((message) => message.scopeKey === activeScope);
-  const feedProps = {
-    currentUserId: user.id,
-    historyLoadState,
-    pending: activePending,
-    theme,
-    timeZone,
-    dayKey,
-    formatMessageTime
-  };
-  const composerProps = {
-    value: messageInput,
-    onChange: setMessageInput,
-    offline: realtimeStatus !== "connected",
-    csrfToken,
-    isSending: activePending.some((message) => message.state === "sending"),
-    errorMessage: messageError
-  };
-
   return (
     <main ref={appShellRef} className="app-shell">
       <AppHeader
@@ -1661,221 +1468,65 @@ export function App() {
             onSessionExpired={clearPrivateSession}
           />
         )}
-        <div className="workspace-content" inert={openOverlay !== null}>
-          <div className="chat-pane">
-            <section className="settings-card workspace-message-panel" aria-labelledby="workspace-messages-title">
-              <header className="chat-pane-header">
-                {openConversation ? (
-                  <DmHeader conversation={openConversation} currentUserId={user.id} />
-                ) : (
-                  <>
-                <span className="channel-hash" aria-hidden="true">#</span>
-                <h2 id="workspace-messages-title">
-                  <button
-                    type="button"
-                    className="channel-name-trigger"
-                    aria-expanded={pinsOpen}
-                    aria-controls="channel-pins-panel"
-                    onClick={() => {
-                      if (!selectedChannel?.canView) return;
-                      setPinsOpen(true);
-                    }}
-                  >
-                    {selectedChannel?.name ?? "Выберите канал"}
-                  </button>
-                </h2>
-                {selectedChannel?.canView && selectedChannel.description && (
-                  <button
-                    type="button"
-                    className="channel-topic"
-                    aria-expanded={expandedChannelTopicId === selectedChannel.id}
-                    aria-controls={`channel-topic-expanded-${selectedChannel.id}`}
-                    onClick={() => setExpandedChannelTopicId((current) => current === selectedChannel.id ? null : selectedChannel.id)}
-                  >
-                    {selectedChannel.description}
-                  </button>
-                )}
-                {selectedChannel?.visibility === "known" && (
-                  <span className="channel-mode-badge">Известен всем, но закрыт</span>
-                )}
-                {selectedChannel?.ownerEditable && (
-                  <button
-                    type="button"
-                    className="icon-btn channel-properties-trigger"
-                    aria-label="Свойства канала"
-                    onClick={() => setChannelPropertiesTarget(selectedChannel)}
-                  >
-                    <GearIcon />
-                  </button>
-                )}
-                  </>
-                )}
-              </header>
-              {selectedChannel?.canView && selectedChannel.description && (
-                <div
-                  id={`channel-topic-expanded-${selectedChannel.id}`}
-                  className="channel-topic-expanded"
-                  hidden={expandedChannelTopicId !== selectedChannel.id}
-                >
-                  {selectedChannel.description}
-                </div>
-              )}
-              {accessDeniedChannelId && (
-                <p className="channel-access-hint" role="status" aria-live="polite">Нет доступа к этому каналу</p>
-              )}
-              <span className="visually-hidden" aria-live="polite">{dmAnnouncement}</span>
-              <span className="visually-hidden" aria-live="polite">{dmMembersAnnouncement}</span>
-              {openConversation ? (
-                <>
-                  <div className="message-stage">
-                    {isConversationHidden && (
-                      <DmHiddenCard
-                        onBack={() => {
-                          setSelectedConversationId(null);
-                          setHiddenConversationId(null);
-                          setHiddenConversationSnapshot(null);
-                          clearHistory();
-                        }}
-                      />
-                    )}
-                    <MessageFeed
-                      {...feedProps}
-                      channelId={openConversation.id}
-                      hasMoreHistory={hasMoreHistory}
-                      onLoadEarlier={(before) => loadHistoryPage("conversation", openConversation.id, before)}
-                      messages={messages.filter((message) => message.conversationId === openConversation.id)}
-                      canManageMessages={false}
-                      onRetry={(clientRequestId) => handleRetryMessage("conversation", clientRequestId)}
-                      onEdit={(messageId, content) => handleEditMessage("conversation", messageId, content)}
-                      onDelete={(messageId) => void handleDeleteMessage("conversation", messageId)}
-                      canEdit={(message) => message.authorId === user.id}
-                      canDelete={(message) => message.authorId === user.id}
-                      onForward={(message) => {
-                        if (message.conversationId === null) return;
-                        setForwardTarget({ source: { kind: "conversation", id: message.conversationId }, message });
-                      }}
-                      showDelivery
-                      emptyState={{
-                        heading: "Это начало переписки — напишите первое",
-                        body: openConversation.kind === "direct"
-                          ? "Отправьте первое сообщение — его увидит собеседник."
-                          : "Отправьте первое сообщение — его увидят участники переписки."
-                      }}
-                    />
-                  </div>
-                  {!isConversationHidden && (
-                    <>
-                      <TypingIndicator label={selectedConversationId ? typingLabelFor(selectedConversationId) : null} />
-                      <MessageComposer
-                        {...composerProps}
-                        onInput={() => {
-                          if (selectedConversationId) emitTyping(selectedConversationId);
-                        }}
-                        onSubmit={(content, token) => handleComposerSubmit("conversation", content, token)}
-                        disabled={false}
-                      />
-                    </>
-                  )}
-                </>
-              ) : selectedChannel ? (
-                <>
-                  <div className="message-stage">
-                    <MessageFeed
-                      {...feedProps}
-                      channelId={selectedChannel.id}
-                      hasMoreHistory={hasMoreHistory && !isSelectedChannelRevoked}
-                      lastReadSeq={channelLastReadSeq ?? 0}
-                      isRevoked={isSelectedChannelRevoked}
-                      onLoadEarlier={loadEarlierMessages}
-                      messages={messages.filter((message) => message.channelId === selectedChannel.id)}
-                      canManageMessages={canManageMessages}
-                      onJumpToUnread={() => {
-                        const article = document.querySelector<HTMLElement>(
-                          '.message-feed [data-first-unread="true"]'
-                        );
-                        article?.scrollIntoView({ behavior: "auto", block: "start" });
-                        article?.focus({ preventScroll: true });
-                      }}
-                      onRetry={(clientRequestId) => handleRetryMessage("channel", clientRequestId)}
-                      onEdit={(messageId, content) => handleEditMessage("channel", messageId, content)}
-                      onDelete={(messageId) => void handleDeleteMessage("channel", messageId)}
-                      canEdit={canEditMessage}
-                      canSeeReaders={(message) => message.authorId === user.id}
-                      onOpenReaders={(message) => {
-                        if (message.channelId === null) return;
-                        openReaders(message.channelId, message.id);
-                      }}
-                      canPin={canManageMessages}
-                      canUnpin={(message) => canManageMessages || message.authorId === user.id}
-                      isPinned={(messageId) => pinnedMessageIds.has(messageId)}
-                      onPin={(message) => void handlePinMessage(message)}
-                      onUnpin={(message) => void handleUnpinMessage(message.id)}
-                      onForward={(message) => {
-                        if (message.channelId === null) return;
-                        setForwardTarget({ source: { kind: "channel", id: message.channelId }, message });
-                      }}
-                      visibleChannelIds={visibleChannelIds}
-                      onJumpToMessage={jumpToForwardedMessage}
-                    />
-                    {selectedChannel.canView && (
-                      <PinnedMessagesPanel
-                        open={pinsOpen}
-                        onClose={() => setPinsOpen(false)}
-                        channelId={selectedChannel.id}
-                        canManageMessages={canManageMessages}
-                        currentUserId={user.id}
-                        pinnedMessageIds={pinnedMessageIds}
-                        onUnpin={handleUnpinMessage}
-                        onJumpToMessage={jumpToPinnedMessage}
-                        timeZone={timeZone}
-                        theme={theme}
-                        onSessionExpired={clearPrivateSession}
-                      />
-                    )}
-                    {isSelectedChannelRevoked && revokedChannel && (
-                      <RevokedAccessCard reason={revokedChannel.reason} onBack={leaveRevokedChannel} />
-                    )}
-                    <MessageReadersModal
-                      open={readersMessage !== null}
-                      onClose={() => setReadersMessage(null)}
-                      channelId={readersMessage?.channelId ?? ""}
-                      messageId={readersMessage?.messageId ?? ""}
-                      timeZone={timeZone}
-                      onSessionExpired={clearPrivateSession}
-                    />
-                  </div>
-                  {!isSelectedChannelRevoked && (
-                    <MessageComposer
-                      {...composerProps}
-                      onSubmit={(content, token) => handleComposerSubmit("channel", content, token)}
-                      disabled={!selectedChannel.canSend}
-                      {...(!selectedChannel.canSend ? { disabledReason: "канал только для чтения" } : {})}
-                    />
-                  )}
-                </>
-              ) : (
-                <p className="settings-copy channel-selection-hint">Выберите канал слева, чтобы открыть переписку.</p>
-              )}
-              {/* Диалог пересылки общий для обеих областей: источник может быть
-                  и каналом, и перепиской. */}
-              {forwardTarget && (
-                <ForwardMessageDialog
-                  open
-                  onClose={() => setForwardTarget(null)}
-                  source={forwardTarget.source}
-                  message={forwardTarget.message}
-                  channels={channels}
-                  categories={categories}
-                  conversations={conversations}
-                  currentUserId={user.id}
-                  onForward={handleForwardMessage}
-                  timeZone={timeZone}
-                />
-              )}
-              <span className="visually-hidden" aria-live="polite">{forwardAnnouncement}</span>
-            </section>
-          </div>
-        </div>
+        <WorkspaceChatPane
+          key={user.id}
+          inactive={openOverlay !== null}
+          currentUserId={user.id}
+          scope={openConversation ? {
+            kind: "conversation",
+            conversation: openConversation,
+            hidden: isConversationHidden,
+            typingLabel: selectedConversationId ? typingLabelFor(selectedConversationId) : null,
+            onType: () => { if (selectedConversationId) emitTyping(selectedConversationId); },
+            onBack: () => {
+              setSelectedConversationId(null);
+              setHiddenConversationId(null);
+              setHiddenConversationSnapshot(null);
+              clearHistory();
+            }
+          } : selectedChannel ? {
+            kind: "channel",
+            channel: selectedChannel,
+            revokedReason: revokedChannel?.id === selectedChannel.id ? revokedChannel.reason : null
+          } : null}
+          history={{
+            messages,
+            pending: pendingMessages,
+            hasMoreHistory,
+            historyLoadState,
+            channelLastReadSeq: channelLastReadSeq ?? 0,
+            loadChannelEarlier: loadEarlierMessages,
+            loadConversationEarlier: (id, before) => loadHistoryPage("conversation", id, before)
+          }}
+          format={{ theme, timeZone, dayKey, formatMessageTime }}
+          composer={{
+            value: messageInput,
+            onChange: setMessageInput,
+            offline: realtimeStatus !== "connected",
+            csrfToken,
+            errorMessage: messageError
+          }}
+          actions={{
+            retry: handleRetryMessage,
+            edit: handleEditMessage,
+            remove: handleDeleteMessage,
+            submit: handleComposerSubmit
+          }}
+          channels={channels}
+          categories={categories}
+          conversations={conversations}
+          selectedChannelId={selectedChannelIdRef}
+          pins={channelPins}
+          topicExpanded={expandedChannelTopicId === selectedChannelId}
+          accessDenied={accessDeniedChannelId !== null}
+          dmAnnouncements={[dmAnnouncement, dmMembersAnnouncement]}
+          onToggleTopic={(id) => setExpandedChannelTopicId((current) => current === id ? null : id)}
+          onOpenProperties={setChannelPropertiesTarget}
+          onLeaveRevokedChannel={leaveRevokedChannel}
+          onSessionExpired={clearPrivateSession}
+          onSelectChannel={selectChannel}
+          onForwarded={applyMessage}
+        />
         <div
           ref={openOverlay === "members" ? setOverlayPanelElement : undefined}
           className={`members-panel${openOverlay === "members" ? " drawer drawer-right is-open" : ""}`}
